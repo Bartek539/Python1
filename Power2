@@ -1,0 +1,3 @@
+pip install pandas openpyxl pyxlsb xlrd pyinstaller
+
+pyinstaller --noconsole --onefile --clean --name "MultiSheetExcelMerger" multi_sheet_merger_app.py
