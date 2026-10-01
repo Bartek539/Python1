@@ -1,1 +1,1 @@
-pyinstaller --noconsole --onefile --windowed --name "Merge Excel File" merge_app.py
+python -m PyInstaller --noconsole --onefile --windowed --name "Merge Excel File" merge_app.py
