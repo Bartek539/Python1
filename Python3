@@ -1,0 +1,396 @@
+import sys
+import os
+import traceback
+import threading
+from pathlib import Path
+import ctypes
+from typing import List, Dict, Tuple, Optional
+
+# --- 1. DEFENSYWNA OBSŁUGA ŚCIEŻEK I BŁĘDÓW SYSTEMOWYCH NA WINDOWS ---
+def get_base_dir() -> Path:
+    """Zwraca katalog, w którym fizycznie znajduje się plik wykonywalny .exe lub skrypt .py."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+BASE_DIR = get_base_dir()
+LOG_FILE = BASE_DIR / "merger_system.log"
+
+def write_log(msg: str) -> None:
+    """Zapisuje zdarzenia do pliku logu z obsługą bezpiecznego kodowania utf-8."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{msg}\n")
+    except Exception:
+        pass
+
+def show_native_error(title: str, message: str) -> None:
+    """Wyświetla modalne okno błędu WinAPI bez konieczności działania pętli Tkintera."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x10000)
+    except Exception:
+        pass
+
+write_log("=== APPLICATION INITIALIZATION STARTED ===")
+
+# --- 2. BEZPIECZNY IMPORT BIBLIOTEK ---
+try:
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+    import pandas as pd
+    import openpyxl
+    write_log("[OK] Core libraries (pandas, openpyxl, tkinter) imported successfully.")
+except Exception as e:
+    err_tb = traceback.format_exc()
+    write_log(f"[FATAL ERROR] Import failed:\n{err_tb}")
+    show_native_error(
+        "Startup Error",
+        f"Nie udało się załadować wymaganych bibliotek:\n\n{str(e)}\n\nSzczegóły w pliku: {LOG_FILE.name}"
+    )
+    sys.exit(1)
+
+
+class MultiSheetMergerApp(tk.Tk):
+    """Natywna aplikacja desktopowa Tkinter/ttk stylizowana pod Windows 11."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Multi-Sheet Excel Merger Studio")
+        self.geometry("640x540")
+        self.resizable(False, False)
+        self.configure(bg="#F5F5F7")
+
+        # Okno bezramkowe z natywnym przeciąganiem
+        self.overrideredirect(True)
+
+        self._setup_styles()
+        self._offset_x = 0
+        self._offset_y = 0
+
+        self._build_title_bar()
+        self._build_form_controls()
+        self._build_action_area()
+        write_log("[OK] GUI components initialized.")
+
+    def _setup_styles(self) -> None:
+        self.style = ttk.Style(self)
+        self.style.theme_use("clam")
+        self.style.configure("TLabel", background="#F5F5F7", foreground="#1D1D1F", font=("Segoe UI", 9))
+        self.style.configure("Header.TLabel", background="#E8E8ED", foreground="#1D1D1F", font=("Segoe UI", 10, "bold"))
+        self.style.configure("Browse.TButton", font=("Segoe UI", 9), background="#0071E3", foreground="white", borderwidth=0, focuscolor="none")
+        self.style.map("Browse.TButton", background=[("active", "#0077ED"), ("disabled", "#D2D2D7")], foreground=[("disabled", "#86868B")])
+        self.style.configure("TEntry", fieldbackground="#FFFFFF", foreground="#1D1D1F", padding=4)
+        self.style.configure("TSpinbox", fieldbackground="#FFFFFF", foreground="#1D1D1F", padding=3)
+
+    def _build_title_bar(self) -> None:
+        self.title_bar = tk.Frame(self, bg="#E8E8ED", height=38)
+        self.title_bar.pack(fill="x", side="top")
+        self.title_bar.pack_propagate(False)
+
+        self.title_bar.bind("<ButtonPress-1>", self._start_move)
+        self.title_bar.bind("<B1-Motion>", self._do_move)
+
+        self.lbl_title = ttk.Label(self.title_bar, text="Multi-Sheet Excel Merger Studio", style="Header.TLabel")
+        self.lbl_title.pack(side="left", padx=15)
+        self.lbl_title.bind("<ButtonPress-1>", self._start_move)
+        self.lbl_title.bind("<B1-Motion>", self._do_move)
+
+        self.btn_close = tk.Button(
+            self.title_bar, text="✕", bg="#FF5F56", fg="white",
+            activebackground="#E0443E", activeforeground="white",
+            font=("Segoe UI", 9, "bold"), bd=0, width=3, height=1,
+            cursor="hand2", relief="flat", command=self.destroy
+        )
+        self.btn_close.pack(side="right", padx=10, pady=6)
+
+    def _start_move(self, event: tk.Event) -> None:
+        self._offset_x = event.x
+        self._offset_y = event.y
+
+    def _do_move(self, event: tk.Event) -> None:
+        delta_x = event.x - self._offset_x
+        delta_y = event.y - self._offset_y
+        self.geometry(f"+{self.winfo_x() + delta_x}+{self.winfo_y() + delta_y}")
+
+    def _build_form_controls(self) -> None:
+        self.content_frame = tk.Frame(self, bg="#F5F5F7")
+        self.content_frame.pack(fill="both", expand=True, padx=25, pady=8)
+
+        # 1. Folder wejściowy
+        ttk.Label(self.content_frame, text="1. Folder wejściowy (pliki do połączenia):").pack(fill="x", pady=(4, 2))
+        box_input = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_input.pack(fill="x", pady=(0, 6))
+        self.entry_input = ttk.Entry(box_input)
+        self.entry_input.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(box_input, text="Przeglądaj", style="Browse.TButton", command=self._browse_input).pack(side="right")
+
+        # 2. Plik kolejności (opcjonalny)
+        ttk.Label(self.content_frame, text="2. Plik kolejności funduszy/plików (Opcjonalnie, Kolumna A):").pack(fill="x", pady=(4, 2))
+        box_order = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_order.pack(fill="x", pady=(0, 6))
+        self.entry_order = ttk.Entry(box_order)
+        self.entry_order.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(box_order, text="Przeglądaj", style="Browse.TButton", command=self._browse_order).pack(side="right")
+
+        # 3. Folder wyjściowy
+        ttk.Label(self.content_frame, text="3. Folder zapisu pliku zbiorczego:").pack(fill="x", pady=(4, 2))
+        box_output = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_output.pack(fill="x", pady=(0, 6))
+        self.entry_output = ttk.Entry(box_output)
+        self.entry_output.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(box_output, text="Przeglądaj", style="Browse.TButton", command=self._browse_output).pack(side="right")
+
+        # 4. Parametry odcinania wierszy (Góra / Dół)
+        box_rows_container = tk.LabelFrame(
+            self.content_frame, text=" Opcje czyszczenia wierszy (w każdym arkuszu) ",
+            bg="#F5F5F7", fg="#1D1D1F", font=("Segoe UI", 9, "bold"), padx=10, pady=8
+        )
+        box_rows_container.pack(fill="x", pady=(6, 4))
+
+        vcmd = (self.register(self._validate_int_only), "%P")
+
+        row_fields = tk.Frame(box_rows_container, bg="#F5F5F7")
+        row_fields.pack(fill="x")
+
+        # Pomijanie pierwszych wierszy
+        f_top = tk.Frame(row_fields, bg="#F5F5F7")
+        f_top.pack(side="left", expand=True, fill="x", padx=(0, 10))
+        ttk.Label(f_top, text="Odetnij wiersze z góry (przed nagłówkiem):").pack(anchor="w")
+        self.spin_top = ttk.Spinbox(f_top, from_=0, to_=9999, width=10, validate="key", validatecommand=vcmd)
+        self.spin_top.set("0")
+        self.spin_top.pack(fill="x", pady=(2, 0))
+
+        # Pomijanie ostatnich wierszy
+        f_bottom = tk.Frame(row_fields, bg="#F5F5F7")
+        f_bottom.pack(side="right", expand=True, fill="x", padx=(10, 0))
+        ttk.Label(f_bottom, text="Odetnij wiersze z dołu (stopka / podsumowania):").pack(anchor="w")
+        self.spin_bottom = ttk.Spinbox(f_bottom, from_=0, to_=9999, width=10, validate="key", validatecommand=vcmd)
+        self.spin_bottom.set("0")
+        self.spin_bottom.pack(fill="x", pady=(2, 0))
+
+    def _validate_int_only(self, value: str) -> bool:
+        if value == "":
+            return True
+        return value.isdigit()
+
+    def _build_action_area(self) -> None:
+        self.btn_run = tk.Button(
+            self, text="URUCHOM MERGE (PO ARKUSZACH)", bg="#28CD41", fg="white",
+            activebackground="#24B338", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), bd=0, width=32, height=2,
+            cursor="hand2", relief="flat", command=self._start_processing_thread
+        )
+        self.btn_run.pack(pady=(4, 6))
+
+        self.lbl_status = tk.Label(self, text="Gotowy do łączenia", bg="#F5F5F7", fg="#86868B", font=("Segoe UI", 9, "bold"))
+        self.lbl_status.pack(pady=(0, 10))
+
+    def _browse_input(self) -> None:
+        path = filedialog.askdirectory(title="Wybierz folder wejściowy")
+        if path:
+            self.entry_input.delete(0, tk.END)
+            self.entry_input.insert(0, str(Path(path)))
+
+    def _browse_order(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Wybierz plik porządkowy",
+            filetypes=[("Pliki Excel / CSV", "*.xlsx *.xlsm *.xlsb *.xls *.csv"), ("Wszystkie pliki", "*.*")]
+        )
+        if file_path:
+            self.entry_order.delete(0, tk.END)
+            self.entry_order.insert(0, str(Path(file_path)))
+
+    def _browse_output(self) -> None:
+        path = filedialog.askdirectory(title="Wybierz folder zapisu")
+        if path:
+            self.entry_output.delete(0, tk.END)
+            self.entry_output.insert(0, str(Path(path)))
+
+    def update_status(self, message: str, hex_color: str) -> None:
+        self.after(0, lambda: self.lbl_status.config(text=message, fg=hex_color))
+
+    def _set_ui_state(self, is_running: bool) -> None:
+        if is_running:
+            self.btn_run.config(state=tk.DISABLED, bg="#D2D2D7", cursor="arrow")
+        else:
+            self.btn_run.config(state=tk.NORMAL, bg="#28CD41", cursor="hand2")
+
+    def _get_row_cutoffs(self) -> Tuple[int, int]:
+        top_str = self.spin_top.get().strip()
+        bot_str = self.spin_bottom.get().strip()
+        skip_top = int(top_str) if top_str.isdigit() else 0
+        skip_bottom = int(bot_str) if bot_str.isdigit() else 0
+        return skip_top, skip_bottom
+
+    def _start_processing_thread(self) -> None:
+        input_dir = self.entry_input.get().strip()
+        output_dir = self.entry_output.get().strip()
+        order_file = self.entry_order.get().strip()
+        skip_top, skip_bottom = self._get_row_cutoffs()
+
+        if not input_dir or not output_dir:
+            self.update_status("Błąd: Folder wejściowy i wyjściowy są wymagane.", "#D70015")
+            return
+
+        self._set_ui_state(is_running=True)
+        self.update_status("Przetwarzanie skoroszytów... Proszę czekać.", "#0071E3")
+        threading.Thread(
+            target=self._process_multi_sheet_merge,
+            args=(input_dir, order_file, output_dir, skip_top, skip_bottom),
+            daemon=True
+        ).start()
+
+    # --- 3. GŁÓWNA LOGIKA PRZETWARZANIA DANYCH ---
+    def _process_multi_sheet_merge(
+        self,
+        input_dir_str: str,
+        order_file_str: str,
+        output_dir_str: str,
+        skip_top: int,
+        skip_bottom: int
+    ) -> None:
+        try:
+            input_dir = Path(input_dir_str)
+            output_file = Path(output_dir_str) / "merged_multi_sheet_output.xlsx"
+
+            # 3.1. Wczytanie opcjonalnego pliku kolejności
+            fund_order: List[str] = []
+            if order_file_str:
+                order_path = Path(order_file_str)
+                if order_path.is_file():
+                    try:
+                        ext = order_path.suffix.lower()
+                        if ext == ".csv":
+                            df_order = pd.read_csv(order_path, usecols=[0], header=None, encoding="utf-8-sig")
+                        else:
+                            engine = "openpyxl" if ext in {".xlsx", ".xlsm"} else ("pyxlsb" if ext == ".xlsb" else "xlrd")
+                            df_order = pd.read_excel(order_path, usecols=[0], header=None, engine=engine)
+                        fund_order = df_order.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+                        write_log(f"[OK] Wczytano regułę kolejności ({len(fund_order)} pozycji).")
+                    except Exception as e:
+                        write_log(f"[WARNING] Nie udało się sparsować pliku kolejności: {e}")
+
+            # 3.2. Identyfikacja i sortowanie plików wejściowych
+            supported_exts = {".xlsx", ".xlsm", ".xlsb", ".xls", ".csv"}
+            files = [
+                p for p in input_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in supported_exts and not p.name.startswith("~$")
+            ]
+
+            if not files:
+                self.update_status("Brak plików Excel/CSV w folderze wejściowym.", "#D70015")
+                return
+
+            if fund_order:
+                def get_sort_key(p: Path):
+                    for idx, code in enumerate(fund_order):
+                        if code in p.name:
+                            return (0, idx)
+                    return (1, p.name)
+                files.sort(key=get_sort_key)
+            else:
+                files.sort(key=lambda p: p.name)
+
+            write_log(f"[INFO] Liczba plików zakwalifikowanych do łączenia: {len(files)}")
+
+            # 3.3. Słownik akumulujący: sheet_name -> lista czystych DataFrame'ów
+            merged_sheets: Dict[str, List[pd.DataFrame]] = {}
+            sheet_discovery_order: List[str] = []
+
+            for file_path in files:
+                ext = file_path.suffix.lower()
+                try:
+                    if ext == ".csv":
+                        sheet_map = {"CSV_Data": None}
+                    else:
+                        engine = "openpyxl" if ext in {".xlsx", ".xlsm"} else ("pyxlsb" if ext == ".xlsb" else "xlrd")
+                        excel_file = pd.ExcelFile(file_path, engine=engine)
+                        sheet_map = {name: name for name in excel_file.sheet_names}
+
+                    for sheet_target_name, sheet_source in sheet_map.items():
+                        if sheet_target_name not in sheet_discovery_order:
+                            sheet_discovery_order.append(sheet_target_name)
+                            merged_sheets[sheet_target_name] = []
+
+                        # Opcja A: skiprows ucina wiersze z góry, kolejny staje się wierszem nagłówka (header=0)
+                        if ext == ".csv":
+                            df = pd.read_csv(
+                                file_path,
+                                skiprows=skip_top,
+                                header=0,
+                                encoding="utf-8-sig",
+                                sep=None,
+                                engine="python"
+                            )
+                        else:
+                            df = pd.read_excel(
+                                file_path,
+                                sheet_name=sheet_source,
+                                skiprows=skip_top,
+                                header=0,
+                                engine=engine
+                            )
+
+                        if df.empty:
+                            continue
+
+                        # Odetnij wiersze ze stopki (skip_bottom)
+                        if skip_bottom > 0:
+                            if skip_bottom >= len(df):
+                                write_log(f"[INFO] Arkusz '{sheet_target_name}' z {file_path.name} pominięty: skip_bottom >= wiersze danych.")
+                                continue
+                            df = df.iloc[:-skip_bottom].copy()
+
+                        # Zapisujemy czystą ramkę danych (bez dodatkowej kolumny _Source_File)
+                        merged_sheets[sheet_target_name].append(df)
+
+                except Exception as e:
+                    write_log(f"[WARNING] Błąd odczytu pliku {file_path.name}: {e}")
+
+            # 3.4. Walidacja wyekstrahowanych danych
+            valid_sheet_count = sum(1 for sheets in merged_sheets.values() if sheets)
+            if valid_sheet_count == 0:
+                self.update_status("Brak danych tabelarycznych po zastosowaniu filtrów wierszy.", "#D70015")
+                return
+
+            # 3.5. Zapis zmergowanych arkuszy do wielozakładkowego pliku .xlsx
+            write_log(f"[INFO] Zapisywanie czystych arkuszy do: {output_file.name}")
+            try:
+                with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+                    for sheet_name in sheet_discovery_order:
+                        df_list = merged_sheets[sheet_name]
+                        if not df_list:
+                            continue
+
+                        # Concat dopasowuje kolumny po nazwach (Opcja A)
+                        final_sheet_df = pd.concat(df_list, ignore_index=True, sort=False)
+
+                        # Bezpieczna nazwa arkusza w Excelu (max 31 znaków, brak znaków zakazanych)
+                        safe_sheet_name = sheet_name.replace(":", "_").replace("\\", "_").replace("/", "_")[:31]
+                        final_sheet_df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
+            except PermissionError:
+                self.update_status("Błąd uprawnień: Zamknij plik wynikowy w Excelu!", "#D70015")
+                return
+
+            self.update_status(f"Sukces! Utworzono {valid_sheet_count} arkuszy w {output_file.name}", "#28CD41")
+            write_log(f"[OK] Pomyślnie zmergowano {len(files)} plików do {output_file}.")
+
+        except Exception as e:
+            err_msg = str(e)[:45]
+            write_log(f"[ERROR] Proces zakończony błędem:\n{traceback.format_exc()}")
+            self.update_status(f"Błąd procesu: {err_msg}", "#D70015")
+        finally:
+            self.after(0, lambda: self._set_ui_state(is_running=False))
+
+
+if __name__ == "__main__":
+    try:
+        app = MultiSheetMergerApp()
+        write_log("[OK] Główna pętla zdarzeń uruchomiona.")
+        app.mainloop()
+    except Exception as e:
+        err_tb = traceback.format_exc()
+        write_log(f"[FATAL CRASH] Aplikacja uległa awarii:\n{err_tb}")
+        show_native_error("Błąd krytyczny aplikacji", f"Wystąpił błąd:\n\n{str(e)}\n\nZobacz: {LOG_FILE.name}")
+        sys.exit(1)
