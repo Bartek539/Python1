@@ -1,0 +1,222 @@
+import os
+import threading
+import pandas as pd
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+from pathlib import Path
+from typing import List
+
+# --- Konfiguracja CustomTkinter (Apple-style) ---
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+class MergeExcelFileApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # Konfiguracja głównego okna (nieco wyższe, aby pomieścić status)
+        self.title("Merge Excel File")
+        self.geometry("600x430")
+        self.resizable(False, False)
+        
+        # Bezramkowe okno z customowym paskiem
+        self.overrideredirect(True)
+        
+        # Pasek tytułowy
+        self.title_bar = ctk.CTkFrame(self, height=40, corner_radius=0, fg_color="transparent")
+        self.title_bar.pack(fill="x", side="top")
+        self.title_bar.bind("<ButtonPress-1>", self.start_move)
+        self.title_bar.bind("<B1-Motion>", self.do_move)
+
+        # Czerwony przycisk zamykania (Apple-style)
+        self.close_button = ctk.CTkButton(
+            self.title_bar, text="✕", width=30, height=30, 
+            fg_color="#FF605C", hover_color="#FF4B47", text_color="white",
+            corner_radius=15, command=self.destroy
+        )
+        self.close_button.pack(side="right", padx=10, pady=5)
+
+        # Tytuł aplikacji
+        self.title_label = ctk.CTkLabel(self.title_bar, text="Merge Excel File", font=("Helvetica", 14, "bold"))
+        self.title_label.pack(side="left", padx=15)
+
+        # --- Główny kontener ---
+        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # 1. Folder wejściowy
+        self.lbl_input = ctk.CTkLabel(self.main_frame, text="1. Input folder (files to merge):", anchor="w")
+        self.lbl_input.pack(fill="x", pady=(10, 0))
+        self.entry_input = ctk.CTkEntry(self.main_frame, placeholder_text="Select folder...")
+        self.entry_input.pack(fill="x", pady=5)
+        self.btn_input = ctk.CTkButton(self.main_frame, text="Browse", command=self.browse_input, width=100)
+        self.btn_input.pack(anchor="e")
+
+        # 2. Plik z kolejnością
+        self.lbl_order = ctk.CTkLabel(self.main_frame, text="2. Fund order file (Optional, column A):", anchor="w")
+        self.lbl_order.pack(fill="x", pady=(10, 0))
+        self.entry_order = ctk.CTkEntry(self.main_frame, placeholder_text="Select file...")
+        self.entry_order.pack(fill="x", pady=5)
+        self.btn_order = ctk.CTkButton(self.main_frame, text="Browse", command=self.browse_order, width=100)
+        self.btn_order.pack(anchor="e")
+
+        # 3. Folder wyjściowy
+        self.lbl_output = ctk.CTkLabel(self.main_frame, text="3. Output folder:", anchor="w")
+        self.lbl_output.pack(fill="x", pady=(10, 0))
+        self.entry_output = ctk.CTkEntry(self.main_frame, placeholder_text="Select destination folder...")
+        self.entry_output.pack(fill="x", pady=5)
+        self.btn_output = ctk.CTkButton(self.main_frame, text="Browse", command=self.browse_output, width=100)
+        self.btn_output.pack(anchor="e")
+
+        # --- Przycisk RUN ---
+        self.btn_run = ctk.CTkButton(
+            self, text="RUN", width=200, height=45,
+            font=("Helvetica", 16, "bold"),
+            fg_color="#00CA4E", hover_color="#00A03E", text_color="white",
+            corner_radius=20, command=self.start_merge_thread
+        )
+        self.btn_run.pack(pady=(15, 5))
+
+        # --- Etykieta Statusu (Zgodnie z wytycznymi, pod przyciskiem RUN) ---
+        self.status_label = ctk.CTkLabel(self, text="", font=("Helvetica", 13, "bold"), text_color="gray")
+        self.status_label.pack(pady=(0, 10))
+
+    # --- Funkcje do obsługi okna ---
+    def start_move(self, event):
+        self.x = event.x
+        self.y = event.y
+
+    def do_move(self, event):
+        deltax = event.x - self.x
+        deltay = event.y - self.y
+        x = self.winfo_x() + deltax
+        y = self.winfo_y() + deltax
+        self.geometry(f"+{x}+{y}")
+
+    # --- Funkcje wyboru plików/folderów ---
+    def browse_input(self):
+        folder = filedialog.askdirectory(title="Select input folder")
+        if folder:
+            self.entry_input.delete(0, 'end')
+            self.entry_input.insert(0, folder)
+
+    def browse_order(self):
+        file = filedialog.askopenfilename(
+            title="Select order file",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if file:
+            self.entry_order.delete(0, 'end')
+            self.entry_order.insert(0, file)
+
+    def browse_output(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self.entry_output.delete(0, 'end')
+            self.entry_output.insert(0, folder)
+
+    # --- Bezpieczna aktualizacja GUI z innego wątku ---
+    def update_status(self, message: str, color: str = "black"):
+        """Używa .after() aby zaktualizować interfejs bezpiecznie w głównym wątku Windowsa."""
+        self.after(0, lambda: self.status_label.configure(text=message, text_color=color))
+
+    # --- Logika łączenia plików ---
+    def start_merge_thread(self):
+        input_dir = self.entry_input.get().strip()
+        output_dir = self.entry_output.get().strip()
+        order_file = self.entry_order.get().strip()
+
+        if not input_dir or not output_dir:
+            self.update_status("Error: Input and Output folders are required!", "#FF605C")
+            return
+
+        self.btn_run.configure(state="disabled", text="Processing...")
+        self.update_status("Merging files in progress... Please wait.", "#007AFF")
+        
+        threading.Thread(target=self.process_files, args=(input_dir, order_file, output_dir), daemon=True).start()
+
+    def process_files(self, input_dir: str, order_file: str, output_dir: str):
+        try:
+            input_path = Path(input_dir)
+            output_file_path = Path(output_dir) / "merged_data_output.xlsx"
+
+            fund_order: List[str] = []
+            if order_file and Path(order_file).exists():
+                try:
+                    if order_file.endswith(".csv"):
+                        df_order = pd.read_csv(order_file, usecols=[0], header=None)
+                    else:
+                        engine = 'openpyxl' if order_file.endswith('.xlsx') else 'xlrd'
+                        df_order = pd.read_excel(order_file, usecols=[0], header=None, engine=engine)
+                    
+                    fund_order = df_order[0].dropna().astype(str).str.strip().tolist()
+                except Exception as e:
+                    self.update_status(f"Order file error: {str(e)[:50]}...", "#FF605C")
+                    self.reset_button()
+                    return
+
+            supported_extensions = {".xls", ".xlsx", ".csv"}
+            files_to_merge = [f for f in input_path.iterdir() if f.is_file() and f.suffix.lower() in supported_extensions]
+
+            if not files_to_merge:
+                self.update_status("No Excel or CSV files found in the input folder.", "#FF605C")
+                self.reset_button()
+                return
+
+            def sort_key(file_path: Path):
+                file_name = file_path.name
+                for idx, fund_num in enumerate(fund_order):
+                    if fund_num in file_name:
+                        return idx
+                return float('inf'), file_name
+
+            if fund_order:
+                files_to_merge.sort(key=sort_key)
+            else:
+                files_to_merge.sort(key=lambda x: x.name)
+
+            dataframes = []
+            for file in files_to_merge:
+                ext = file.suffix.lower()
+                try:
+                    if ext == ".csv":
+                        df = pd.read_csv(file, encoding="utf-8-sig", sep=None, engine="python")
+                    elif ext == ".xlsx":
+                        df = pd.read_excel(file, engine="openpyxl")
+                    elif ext == ".xls":
+                        df = pd.read_excel(file, engine="xlrd")
+                    dataframes.append(df)
+                except Exception:
+                    pass # Pomijamy pliki, których struktura jest uszkodzona, aby nie przerywać mergowania reszty
+
+            if not dataframes:
+                self.update_status("Failed to read valid data from the selected files.", "#FF605C")
+                self.reset_button()
+                return
+
+            # pd.concat załatwia sprawę usuwania powielonych nagłówków
+            merged_df = pd.concat(dataframes, ignore_index=True)
+
+            try:
+                merged_df.to_excel(output_file_path, index=False, engine="openpyxl")
+            except PermissionError:
+                # Blokada biznesowa - Windows odmawia zapisu nadpisywanego pliku, gdy użytkownik ma go otwartego
+                self.update_status("Permission denied! Close the output Excel file and try again.", "#FF605C")
+                self.reset_button()
+                return
+
+            # Sukces
+            self.update_status(f"Success! Output file is ready: {output_file_path.name}", "#00CA4E")
+
+        except Exception as e:
+            self.update_status("A critical error occurred. Check input data.", "#FF605C")
+        finally:
+            self.reset_button()
+
+    def reset_button(self):
+        """Przywraca przycisk z wątku tła do głównego wątku GUI."""
+        self.after(0, lambda: self.btn_run.configure(state="normal", text="RUN"))
+
+if __name__ == "__main__":
+    app = MergeExcelFileApp()
+    app.mainloop()
