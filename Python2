@@ -1,0 +1,352 @@
+import os
+import threading
+from pathlib import Path
+from typing import List, Optional
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import pandas as pd
+
+
+class MergeExcelFileNativeApp(tk.Tk):
+    """
+    Natywna aplikacja desktopowa Windows do łączenia plików XLS, XLSX i CSV.
+    Wykorzystuje wyłącznie wbudowaną bibliotekę tkinter/ttk (brak zależności zewnętrznych dla GUI).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        # Konfiguracja bazowa okna
+        self.title("Merge Excel File")
+        self.geometry("620x460")
+        self.resizable(False, False)
+        self.configure(bg="#F5F5F7")  # Jasnoszary odcień w stylistyce macOS/Windows 11
+
+        # Usunięcie standardowej ramki systemowej (Custom Titlebar)
+        self.overrideredirect(True)
+
+        # Inicjalizacja stylów ttk
+        self._setup_styles()
+
+        # Zmienne koordynatów do przemieszczania okna
+        self._offset_x: int = 0
+        self._offset_y: int = 0
+
+        # Budowa komponentów interfejsu
+        self._build_title_bar()
+        self._build_form_controls()
+        self._build_action_area()
+
+    def _setup_styles(self) -> None:
+        """Konfiguracja stylistyki kontrolek ttk pod nowoczesny, płaski design."""
+        self.style = ttk.Style(self)
+        self.style.theme_use("clam")
+
+        # Konfiguracja etykiet
+        self.style.configure(
+            "TLabel",
+            background="#F5F5F7",
+            foreground="#1D1D1F",
+            font=("Segoe UI", 10)
+        )
+        self.style.configure(
+            "Header.TLabel",
+            background="#E8E8ED",
+            foreground="#1D1D1F",
+            font=("Segoe UI", 11, "bold")
+        )
+
+        # Przycisk przeglądania plików (Browse)
+        self.style.configure(
+            "Browse.TButton",
+            font=("Segoe UI", 9),
+            background="#0071E3",
+            foreground="white",
+            borderwidth=0,
+            focuscolor="none"
+        )
+        self.style.map(
+            "Browse.TButton",
+            background=[("active", "#0077ED"), ("disabled", "#D2D2D7")],
+            foreground=[("disabled", "#86868B")]
+        )
+
+        # Pola wprowadzania danych
+        self.style.configure(
+            "TEntry",
+            fieldbackground="#FFFFFF",
+            foreground="#1D1D1F",
+            padding=5
+        )
+
+    def _build_title_bar(self) -> None:
+        """Budowa paska tytułowego umożliwiającego przesuwanie okna oraz zamknięcie."""
+        self.title_bar = tk.Frame(self, bg="#E8E8ED", height=40)
+        self.title_bar.pack(fill="x", side="top")
+        self.title_bar.pack_propagate(False)
+
+        # Przechwytywanie zdarzeń myszy do przesuwania okna
+        self.title_bar.bind("<ButtonPress-1>", self._start_move)
+        self.title_bar.bind("<B1-Motion>", self._do_move)
+
+        # Tytuł okna
+        self.lbl_title = ttk.Label(
+            self.title_bar,
+            text="Merge Excel File",
+            style="Header.TLabel"
+        )
+        self.lbl_title.pack(side="left", padx=15)
+        self.lbl_title.bind("<ButtonPress-1>", self._start_move)
+        self.lbl_title.bind("<B1-Motion>", self._do_move)
+
+        # Przycisk zamykania programu (Apple-style czerwone koło z krzyżykiem)
+        self.btn_close = tk.Button(
+            self.title_bar,
+            text="✕",
+            bg="#FF5F56",
+            fg="white",
+            activebackground="#E0443E",
+            activeforeground="white",
+            font=("Segoe UI", 9, "bold"),
+            bd=0,
+            width=3,
+            height=1,
+            cursor="hand2",
+            relief="flat",
+            command=self.destroy
+        )
+        self.btn_close.pack(side="right", padx=12, pady=8)
+
+    def _start_move(self, event: tk.Event) -> None:
+        self._offset_x = event.x
+        self._offset_y = event.y
+
+    def _do_move(self, event: tk.Event) -> None:
+        delta_x = event.x - self._offset_x
+        delta_y = event.y - self._offset_y
+        new_x = self.winfo_x() + delta_x
+        new_y = self.winfo_y() + delta_y
+        self.geometry(f"+{new_x}+{new_y}")
+
+    def _build_form_controls(self) -> None:
+        """Tworzy trzy główne sekcje wyboru ścieżek."""
+        self.content_frame = tk.Frame(self, bg="#F5F5F7")
+        self.content_frame.pack(fill="both", expand=True, padx=25, pady=10)
+
+        # 1. Input folder
+        lbl_input = ttk.Label(self.content_frame, text="1. Input folder (files to merge):")
+        lbl_input.pack(fill="x", pady=(8, 2))
+
+        box_input = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_input.pack(fill="x", pady=(0, 8))
+        self.entry_input = ttk.Entry(box_input)
+        self.entry_input.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn_input = ttk.Button(box_input, text="Browse", style="Browse.TButton", command=self._browse_input)
+        btn_input.pack(side="right")
+
+        # 2. Fund order file
+        lbl_order = ttk.Label(self.content_frame, text="2. Fund order file (Optional, column A):")
+        lbl_order.pack(fill="x", pady=(8, 2))
+
+        box_order = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_order.pack(fill="x", pady=(0, 8))
+        self.entry_order = ttk.Entry(box_order)
+        self.entry_order.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn_order = ttk.Button(box_order, text="Browse", style="Browse.TButton", command=self._browse_order)
+        btn_order.pack(side="right")
+
+        # 3. Output folder
+        lbl_output = ttk.Label(self.content_frame, text="3. Output folder:")
+        lbl_output.pack(fill="x", pady=(8, 2))
+
+        box_output = tk.Frame(self.content_frame, bg="#F5F5F7")
+        box_output.pack(fill="x", pady=(0, 8))
+        self.entry_output = ttk.Entry(box_output)
+        self.entry_output.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        btn_output = ttk.Button(box_output, text="Browse", style="Browse.TButton", command=self._browse_output)
+        btn_output.pack(side="right")
+
+    def _build_action_area(self) -> None:
+        """Tworzy przycisk uruchomienia procesu oraz pole dynamicznego statusu."""
+        # Zielony przycisk RUN
+        self.btn_run = tk.Button(
+            self,
+            text="RUN",
+            bg="#28CD41",
+            fg="white",
+            activebackground="#24B338",
+            activeforeground="white",
+            font=("Segoe UI", 12, "bold"),
+            bd=0,
+            width=18,
+            height=2,
+            cursor="hand2",
+            relief="flat",
+            command=self._start_processing_thread
+        )
+        self.btn_run.pack(pady=(5, 8))
+
+        # Etykieta statusowa na dole
+        self.lbl_status = tk.Label(
+            self,
+            text="",
+            bg="#F5F5F7",
+            fg="#86868B",
+            font=("Segoe UI", 9, "bold")
+        )
+        self.lbl_status.pack(pady=(0, 15))
+
+    # --- Obsługa okien dialogowych wyboru ścieżek ---
+    def _browse_input(self) -> None:
+        path = filedialog.askdirectory(title="Select input folder containing files to merge")
+        if path:
+            self.entry_input.delete(0, tk.END)
+            self.entry_input.insert(0, str(Path(path)))
+
+    def _browse_order(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Select file containing fund sequence in Column A",
+            filetypes=[("Excel / CSV files", "*.xlsx *.xls *.csv"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.entry_order.delete(0, tk.END)
+            self.entry_order.insert(0, str(Path(file_path)))
+
+    def _browse_output(self) -> None:
+        path = filedialog.askdirectory(title="Select output folder for the consolidated file")
+        if path:
+            self.entry_output.delete(0, tk.END)
+            self.entry_output.insert(0, str(Path(path)))
+
+    # --- Bezpieczna aktualizacja GUI w wątku Windows ---
+    def update_status_message(self, message: str, hex_color: str) -> None:
+        """Wątkowo-bezpieczna zmiana komunikatu statusu za pośrednictwem pętli zdarzeń."""
+        self.after(0, lambda: self.lbl_status.config(text=message, fg=hex_color))
+
+    def _set_ui_state(self, is_running: bool) -> None:
+        """Blokuje kontrolki podczas mergowania danych."""
+        if is_running:
+            self.btn_run.config(state=tk.DISABLED, bg="#D2D2D7", cursor="arrow")
+        else:
+            self.btn_run.config(state=tk.NORMAL, bg="#28CD41", cursor="hand2")
+
+    # --- Logika scalania danych w osobnym wątku ---
+    def _start_processing_thread(self) -> None:
+        input_dir = self.entry_input.get().strip()
+        output_dir = self.entry_output.get().strip()
+        order_file = self.entry_order.get().strip()
+
+        if not input_dir or not output_dir:
+            self.update_status_message("Error: Both Input folder and Output folder are required.", "#D70015")
+            return
+
+        self._set_ui_state(is_running=True)
+        self.update_status_message("Processing data... Please wait.", "#0071E3")
+
+        # Uruchomienie kalkulacji w tle zapobiega zamrożeniu okna Windows
+        worker = threading.Thread(
+            target=self._process_merge,
+            args=(input_dir, order_file, output_dir),
+            daemon=True
+        )
+        worker.start()
+
+    def _process_merge(self, input_dir_str: str, order_file_str: str, output_dir_str: str) -> None:
+        try:
+            input_dir = Path(input_dir_str)
+            output_dir = Path(output_dir_str)
+            output_file = output_dir / "merged_data_output.xlsx"
+
+            if not input_dir.is_dir():
+                self.update_status_message("Error: Selected input directory does not exist.", "#D70015")
+                return
+
+            # 1. Odczyt kolejności funduszy z kolumny A (jeśli plik został podany)
+            fund_order: List[str] = []
+            if order_file_str:
+                order_path = Path(order_file_str)
+                if order_path.is_file():
+                    try:
+                        ext = order_path.suffix.lower()
+                        if ext == ".csv":
+                            df_order = pd.read_csv(order_path, usecols=[0], header=None)
+                        elif ext == ".xlsx":
+                            df_order = pd.read_excel(order_path, usecols=[0], header=None, engine="openpyxl")
+                        elif ext == ".xls":
+                            df_order = pd.read_excel(order_path, usecols=[0], header=None, engine="xlrd")
+                        else:
+                            df_order = pd.DataFrame()
+
+                        if not df_order.empty:
+                            fund_order = df_order.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+                    except Exception as err:
+                        self.update_status_message(f"Order file read warning: {str(err)[:40]}", "#D70015")
+
+            # 2. Identyfikacja plików do konsolidacji
+            supported_exts = {".xlsx", ".xls", ".csv"}
+            files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in supported_exts]
+
+            if not files:
+                self.update_status_message("No valid Excel or CSV files found in the folder.", "#D70015")
+                return
+
+            # 3. Sortowanie plików według funduszy lub alfabetycznie
+            if fund_order:
+                def get_fund_sort_key(file_path: Path):
+                    fname = file_path.name
+                    for idx, fund_code in enumerate(fund_order):
+                        if fund_code in fname:
+                            return (0, idx)
+                    return (1, fname)
+
+                files.sort(key=get_fund_sort_key)
+            else:
+                files.sort(key=lambda p: p.name)
+
+            # 4. Wczytywanie i łączenie danych w pamięci
+            dfs_to_concat: List[pd.DataFrame] = []
+            for file_path in files:
+                ext = file_path.suffix.lower()
+                try:
+                    if ext == ".csv":
+                        # utf-8-sig zapobiega błędom kodowania na polskim Windowsie; sep=None sam dobiera separator
+                        df = pd.read_csv(file_path, encoding="utf-8-sig", sep=None, engine="python")
+                    elif ext == ".xlsx":
+                        df = pd.read_excel(file_path, engine="openpyxl")
+                    elif ext == ".xls":
+                        df = pd.read_excel(file_path, engine="xlrd")
+                    else:
+                        continue
+
+                    if not df.empty:
+                        dfs_to_concat.append(df)
+                except Exception:
+                    # Pomijamy uszkodzone pliki, kontynuując przetwarzanie pozostałych
+                    continue
+
+            if not dfs_to_concat:
+                self.update_status_message("Failed to extract data: files are empty or corrupted.", "#D70015")
+                return
+
+            # Concat zachowuje nagłówek z pierwszego zbioru i dopasowuje strukturę reszty
+            merged_dataframe = pd.concat(dfs_to_concat, ignore_index=True)
+
+            # 5. Eksport do formatu Excel (.xlsx) z obsługą blokady pliku
+            try:
+                merged_dataframe.to_excel(output_file, index=False, engine="openpyxl")
+            except PermissionError:
+                self.update_status_message("Permission Denied: Close output Excel file first!", "#D70015")
+                return
+
+            self.update_status_message(f"Success! Output file is ready: {output_file.name}", "#28CD41")
+
+        except Exception as err:
+            self.update_status_message(f"Unexpected error: {str(err)[:45]}", "#D70015")
+        finally:
+            self.after(0, lambda: self._set_ui_state(is_running=False))
+
+
+if __name__ == "__main__":
+    app = MergeExcelFileNativeApp()
+    app.mainloop()
