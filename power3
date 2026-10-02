@@ -1,0 +1,4 @@
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install "pandas>=2.2" "openpyxl>=3.1" xlrd pyxlsb pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --windowed --name merge --hidden-import openpyxl --hidden-import xlrd --hidden-import pyxlsb merge.py
