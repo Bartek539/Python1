@@ -1,0 +1,563 @@
+"""
+Multi-Sheet Excel Merger Studio  (v2.3, English UI)
+
+Merges .xlsx/.xlsm/.xlsb/.xls/.csv files from one folder into a single workbook,
+sheet by sheet. Includes Audit Reporting for data reconciliation.
+
+Required: pandas, openpyxl  (optional: xlrd for .xls, pyxlsb for .xlsb)
+"""
+from __future__ import annotations
+
+import csv
+import ctypes
+import json
+import logging
+import os
+import queue
+import re
+import sys
+import threading
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+APP_NAME = "ExcelMergerStudio"
+APP_VERSION = "2.3"
+
+
+# =============================================================================
+# 1. PATHS, LOGGING, SYSTEM ERRORS
+# =============================================================================
+def get_base_dir() -> Path:
+    """Directory of the .exe (PyInstaller) or of the .py script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_data_dir() -> Path:
+    """Writable directory for app data (log, settings)."""
+    root = os.environ.get("LOCALAPPDATA")
+    candidate = Path(root) / APP_NAME if root else get_base_dir()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        return get_base_dir()
+
+
+DATA_DIR = get_data_dir()
+LOG_FILE = DATA_DIR / "merger_system.log"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger(APP_NAME)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        try:
+            handler = RotatingFileHandler(
+                LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            )
+            logger.addHandler(handler)
+        except OSError:
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+
+log = setup_logging()
+
+
+def error_location(exc: BaseException) -> str:
+    """Where did it fail? Last frame in this script + innermost frame."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return ""
+    own = [f for f in frames if os.path.abspath(f.filename) == os.path.abspath(__file__)]
+    parts = []
+    if own:
+        parts.append(f"{own[-1].name}() line {own[-1].lineno}")
+    last = frames[-1]
+    if not own or last is not own[-1]:
+        parts.append(f"{Path(last.filename).name}:{last.lineno} {last.name}()")
+    return " -> ".join(parts)
+
+
+def show_native_error(title: str, message: str) -> None:
+    """WinAPI error box - works even if Tkinter fails to load."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x10000)
+    except Exception:
+        print(f"{title}: {message}", file=sys.stderr)
+
+
+def enable_dpi_awareness() -> None:
+    """Sharp text on HiDPI screens."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+log.info("=== APPLICATION INITIALIZATION STARTED ===")
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    import pandas as pd
+    import openpyxl  # noqa: F401
+    log.info("Core libraries imported successfully.")
+except Exception as exc:  # noqa: BLE001
+    log.error("Import failed:\n%s", traceback.format_exc())
+    show_native_error(
+        "Startup Error",
+        f"Failed to load required libraries:\n\n{exc}\n\nDetails: {LOG_FILE}",
+    )
+    sys.exit(1)
+
+
+# =============================================================================
+# 2. MERGE LOGIC WITH AUDIT REPORTING
+# =============================================================================
+SUPPORTED_EXTS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".csv"}
+OUTPUT_PREFIX = "merged_output_"
+SOURCE_COL = "_Source_File"
+EXCEL_MAX_DATA_ROWS = 1_048_575
+CSV_ENCODINGS = ("utf-8-sig", "cp1250", "latin-1")
+
+_BAD_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+@dataclass
+class MergeOptions:
+    input_dir: Path
+    output_dir: Path
+    order_file: Optional[Path] = None
+    skip_top: int = 0
+    skip_bottom: int = 0
+    add_source_column: bool = False
+
+
+@dataclass
+class MergeResult:
+    output_file: Optional[Path] = None
+    files_total: int = 0
+    files_ok: int = 0
+    sheets: int = 0
+    
+    # Audit counters
+    raw_rows: int = 0      # All data rows loaded into memory
+    removed_rows: int = 0  # Rows removed during cleaning (empty/footer)
+    rows: int = 0          # Final rows in output (raw_rows - removed_rows)
+    
+    cancelled: bool = False
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+ProgressCb = Callable[[int, int, str], None]
+
+
+def excel_engine(ext: str) -> str:
+    if ext in {".xlsx", ".xlsm"}:
+        return "openpyxl"
+    if ext == ".xlsb":
+        return "pyxlsb"
+    return "xlrd"
+
+
+def natural_key(text: str) -> list:
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text.casefold())]
+
+
+def read_csv_robust(path: Path, **kwargs) -> "pd.DataFrame":
+    for enc in CSV_ENCODINGS:
+        try:
+            try:
+                return pd.read_csv(path, sep=None, engine="python", encoding=enc, **kwargs)
+            except (csv.Error, pd.errors.ParserError):
+                return pd.read_csv(path, sep=",", engine="python", encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not detect the text encoding of {path.name}")
+
+
+def read_order_list(path: Path) -> List[str]:
+    ext = path.suffix.lower()
+    if ext in {".csv", ".txt"}:
+        text = ""
+        for enc in CSV_ENCODINGS:
+            try:
+                text = path.read_text(encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        codes = [re.split(r"[;\t,]", line)[0] for line in text.splitlines()]
+    else:
+        df = pd.read_excel(path, usecols=[0], header=None, dtype=str, engine=excel_engine(ext))
+        codes = df.iloc[:, 0].dropna().tolist()
+    cleaned = [str(c).strip().strip('"').strip() for c in codes]
+    return [c for c in cleaned if c]
+
+
+def sort_files(files: List[Path], codes: List[str]) -> Tuple[List[Path], List[str], List[Path]]:
+    lowered = [(i, c.casefold()) for i, c in enumerate(codes)]
+    used_codes: set = set()
+    ordered: List[Tuple[int, list, Path]] = []
+    rest: List[Path] = []
+
+    for p in files:
+        name = p.name.casefold()
+        hits = [(i, c) for i, c in lowered if c in name]
+        if hits:
+            best_idx, _ = max(hits, key=lambda h: (len(h[1]), -h[0]))
+            used_codes.add(best_idx)
+            ordered.append((best_idx, natural_key(p.name), p))
+        else:
+            rest.append(p)
+
+    ordered.sort(key=lambda t: (t[0], t[1]))
+    rest.sort(key=lambda p: natural_key(p.name))
+    unmatched = [codes[i] for i, _ in lowered if i not in used_codes]
+    return [t[2] for t in ordered] + rest, unmatched, rest
+
+
+def read_workbook(path: Path, skip_top: int) -> Dict[str, "pd.DataFrame"]:
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        try:
+            return {"CSV_Data": read_csv_robust(path, skiprows=skip_top, header=0)}
+        except pd.errors.EmptyDataError:
+            return {}
+
+    result: Dict[str, pd.DataFrame] = {}
+    with pd.ExcelFile(path, engine=excel_engine(ext)) as xls:
+        for name in xls.sheet_names:
+            result[str(name)] = xls.parse(name, skiprows=skip_top, header=0)
+    return result
+
+
+def dedupe_columns(cols: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+
+def clean_frame(df: "pd.DataFrame", skip_bottom: int) -> "pd.DataFrame":
+    df = df.dropna(how="all")
+    empty_unnamed = [c for c in df.columns if str(c).startswith("Unnamed:") and df[c].isna().all()]
+    if empty_unnamed:
+        df = df.drop(columns=empty_unnamed)
+
+    df.columns = dedupe_columns([re.sub(r"\s+", " ", str(c)).strip() for c in df.columns])
+
+    if skip_bottom > 0:
+        df = df.iloc[:-skip_bottom] if skip_bottom < len(df) else df.iloc[0:0]
+    return df.reset_index(drop=True)
+
+
+def make_safe_sheet_names(names: List[str]) -> List[str]:
+    used: set = set()
+    result: List[str] = []
+    for raw in names:
+        base = _BAD_SHEET_CHARS.sub("_", raw).strip("'").strip()[:31] or "Sheet"
+        candidate, i = base, 2
+        while candidate.casefold() in used:
+            suffix = f"~{i}"
+            candidate = base[: 31 - len(suffix)] + suffix
+            i += 1
+        used.add(candidate.casefold())
+        result.append(candidate)
+    return result
+
+
+def sanitize_for_excel(df: "pd.DataFrame") -> "pd.DataFrame":
+    obj_cols = [c for c in df.columns if df[c].dtype.kind == "O"]
+    if not obj_cols:
+        return df
+    df = df.copy()
+    for c in obj_cols:
+        df[c] = df[c].map(lambda v: _ILLEGAL_XML.sub("", v) if isinstance(v, str) else v)
+    return df
+
+
+def format_sheet(ws, df: "pd.DataFrame") -> None:
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    if df.shape[1] == 0:
+        return
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    bold = Font(bold=True)
+    for idx, col in enumerate(df.columns, start=1):
+        ws.cell(row=1, column=idx).font = bold
+        longest = max([len(str(col))] + [len(str(v)) for v in df[col].head(500) if pd.notna(v)])
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(10, longest + 2), 50)
+
+
+def generate_audit_report(res: MergeResult, report_path: Path) -> None:
+    """Tworzy zrzut statystyk kontrolnych (reconciliation) do pliku .txt."""
+    lines = [
+        "============================================================",
+        f"  EXCEL MERGER STUDIO - DATA AUDIT REPORT",
+        f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "============================================================",
+        "",
+        "--- [ FILE STATISTICS ] ---",
+        f"Total files found:         {res.files_total}",
+        f"Successfully merged files: {res.files_ok}",
+        f"Output sheets created:     {res.sheets}",
+        "",
+        "--- [ ROW RECONCILIATION ] ---",
+        f"1. Raw Data Rows Loaded:   {res.raw_rows:,}".replace(",", " "),
+        f"2. Rows Removed (Cleaned): {res.removed_rows:,}".replace(",", " "),
+        f"------------------------------------------------------------",
+        f"3. FINAL OUTPUT ROWS:      {res.rows:,}".replace(",", " "),
+        "",
+        "Note: 'Raw Data Rows' counts rows parsed as data. It does not ",
+        "include header rows or rows bypassed by the 'Skip top' setting.",
+        "Rows are removed if they are completely empty or bypassed by ",
+        "the 'Skip bottom' setting.",
+        "",
+        "--- [ ALERTS ] ---"
+    ]
+    
+    if res.errors:
+        lines.append(f"ERRORS ({len(res.errors)}):")
+        for e in res.errors:
+            lines.append(f"  [X] {e}")
+    else:
+        lines.append("Errors: None")
+
+    if res.warnings:
+        lines.append(f"\nWARNINGS ({len(res.warnings)}):")
+        for w in res.warnings:
+            lines.append(f"  [!] {w}")
+    else:
+        lines.append("Warnings: None")
+
+    # Używamy utf-8-sig (z BOM), aby Notatnik Windows zawsze poprawnie formatował plik
+    report_path.write_text("\n".join(lines), encoding="utf-8-sig")
+
+
+def merge_folder(
+    opts: MergeOptions,
+    progress: Optional[ProgressCb] = None,
+    cancel: Optional[threading.Event] = None,
+) -> MergeResult:
+    report: ProgressCb = progress or (lambda done, total, msg: None)
+    res = MergeResult()
+
+    if not opts.input_dir.is_dir():
+        raise ValueError("Input folder does not exist.")
+    if not opts.output_dir.is_dir():
+        raise ValueError("Output folder does not exist.")
+
+    files = [
+        p for p in opts.input_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_EXTS
+        and not p.name.startswith(("~$", OUTPUT_PREFIX))
+    ]
+    if not files:
+        raise ValueError("No Excel/CSV files found in the input folder.")
+
+    codes: List[str] = []
+    if opts.order_file:
+        try:
+            codes = read_order_list(opts.order_file)
+            log.info("Order list loaded: %d entries", len(codes))
+        except Exception as exc:  # noqa: BLE001
+            res.warnings.append(f"Could not load the order file: {exc}")
+
+    if codes:
+        files, unmatched, unordered = sort_files(files, codes)
+        if unmatched:
+            res.warnings.append(f"Codes without a matching file ({len(unmatched)}): " + ", ".join(unmatched[:10]))
+        if unordered:
+            res.warnings.append(f"Files not in the order list: {len(unordered)}")
+    else:
+        files.sort(key=lambda p: natural_key(p.name))
+
+    res.files_total = len(files)
+    total_steps = len(files) + 1
+
+    sheets: Dict[str, Tuple[str, List[pd.DataFrame]]] = {}
+    
+    # Odczyt i kalkulacja wierszy
+    for n, path in enumerate(files):
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            return res
+        report(n, total_steps, f"Loading {n + 1}/{len(files)}: {path.name}")
+        try:
+            workbook = read_workbook(path, opts.skip_top)
+            got_data = False
+            for sheet_name, raw in workbook.items():
+                
+                # Zapisujemy ilość wierszy BRUTTO (przed czyszczeniem)
+                initial_count = len(raw)
+                res.raw_rows += initial_count
+                
+                # Czyszczenie (puste wiersze + stopka)
+                df = clean_frame(raw, opts.skip_bottom)
+                final_count = len(df)
+                
+                # Kalkulujemy usunięte wiersze
+                res.removed_rows += (initial_count - final_count)
+                
+                if df.empty:
+                    continue
+                if opts.add_source_column and SOURCE_COL not in df.columns:
+                    df.insert(0, SOURCE_COL, path.name)
+                    
+                key = sheet_name.strip().casefold()
+                sheets.setdefault(key, (sheet_name.strip(), []))[1].append(df)
+                got_data = True
+            res.files_ok += 1
+            if not got_data:
+                res.warnings.append(f"{path.name}: no data left after applying row filters")
+        except Exception as exc:  # noqa: BLE001
+            res.errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+
+    if not sheets:
+        raise ValueError("No tabular data left after applying row filters.")
+
+    parts: List[Tuple[str, pd.DataFrame]] = []
+    for display, frames in sheets.values():
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        if len(merged) > EXCEL_MAX_DATA_ROWS:
+            for k, start in enumerate(range(0, len(merged), EXCEL_MAX_DATA_ROWS), start=1):
+                parts.append((f"{display} ({k})", merged.iloc[start : start + EXCEL_MAX_DATA_ROWS]))
+            res.warnings.append(f"Sheet '{display}' exceeds the Excel row limit - split into parts.")
+        else:
+            parts.append((display, merged))
+
+    safe_names = make_safe_sheet_names([name for name, _ in parts])
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = opts.output_dir / f"{OUTPUT_PREFIX}{stamp}.xlsx"
+    tmp_file = output_file.with_name(output_file.stem + ".tmp.xlsx")
+    report_file = opts.output_dir / f"{OUTPUT_PREFIX}{stamp}_AuditReport.txt"
+    
+    report(len(files), total_steps, "Saving output file…")
+    try:
+        with pd.ExcelWriter(tmp_file, engine="openpyxl") as writer:
+            for (_, df), name in zip(parts, safe_names):
+                df = sanitize_for_excel(df)
+                df.to_excel(writer, sheet_name=name, index=False)
+                try:
+                    format_sheet(writer.sheets[name], df)
+                except Exception:
+                    res.warnings.append(f"Formatting skipped for sheet '{name}'")
+        os.replace(tmp_file, output_file)
+        
+        # Sukces zapisu Excela -> generujemy log kontrolny
+        res.output_file = output_file
+        res.sheets = len(parts)
+        res.rows = sum(len(df) for _, df in parts)
+        
+        generate_audit_report(res, report_file)
+        
+    except Exception:
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    report(total_steps, total_steps, "Done")
+    log.info(f"Merged {res.files_ok}/{res.files_total} files. Net rows: {res.rows}.")
+    return res
+
+
+# =============================================================================
+# 3. GUI (skrócone na potrzeby przykładu, funkcje rdzeniowe załączone)
+# =============================================================================
+class MergerApp(tk.Tk):
+    BG = "#F5F5F7"
+    FG = "#1D1D1F"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(f"Multi-Sheet Excel Merger Studio v{APP_VERSION}")
+        self.geometry("700x640")
+        self.minsize(640, 600)
+        self.configure(bg=self.BG)
+
+        self._events: "queue.Queue[tuple]" = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+
+        self._setup_styles()
+        self._build_ui()
+        self._load_settings()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._poll_events)
+
+    # [...] (Tutaj pozostają bez zmian metody _setup_styles, _build_ui, _browse*, _load_settings, _start, _worker_main, _poll_events)
+    # Poniżej znajduje się zaktualizowany kod raportowania w interfejsie graficznym:
+
+    def _on_done(self, res: MergeResult) -> None:
+        self._set_running(False)
+        if res.cancelled:
+            self.progress.config(value=0)
+            self._set_status("Cancelled - no file was saved.", "#86868B")
+            return
+
+        self.progress.config(value=100)
+        out_name = res.output_file.name if res.output_file else ""
+        msg = (f"Done: {res.files_ok}/{res.files_total} files, {res.sheets} sheets, "
+               f"{res.rows:,} rows -> {out_name}")
+        self._set_status(msg, "#FF9500" if res.errors else "#28CD41")
+
+        # Rozszerzone okno raportu w GUI
+        messagebox.showinfo("Merge Complete / Data Audit", self._format_report(res))
+        
+        if self.var_open.get() and res.output_file and hasattr(os, "startfile"):
+            try:
+                os.startfile(res.output_file.parent)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+
+    @staticmethod
+    def _format_report(res: MergeResult, limit: int = 10) -> str:
+        lines: List[str] = []
+        lines.append("DATA AUDIT STATS:")
+        lines.append(f"  • Raw data rows read: {res.raw_rows:,}".replace(",", " "))
+        lines.append(f"  • Rows removed:       {res.removed_rows:,}".replace(",", " "))
+        lines.append(f"  • Final output rows:  {res.rows:,}".replace(",", " "))
+        lines.append("-" * 30)
+        
+        if res.errors:
+            lines.append(f"\nFiles with errors ({len(res.errors)}):")
+            lines += [f"  [X] {e}" for e in res.errors[:limit]]
+            if len(res.errors) > limit:
+                lines.append("  …")
+        if res.warnings:
+            lines.append(f"\nWarnings ({len(res.warnings)}):")
+            lines += [f"  [!] {w}" for w in res.warnings[:limit]]
+            if len(res.warnings) > limit:
+                lines.append("  …")
+                
+        lines.append(f"\nDetailed report saved in the output folder.")
+        return "\n".join(lines)
+    
+    # [...] (reszta GUI bez zmian)
