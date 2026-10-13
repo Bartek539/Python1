@@ -1,0 +1,1 @@
+pyinstaller --noconsole --onefile --name ExcelMergerStudio --hidden-import win32com --hidden-import pythoncom --hidden-import openpyxl --hidden-import pyxlsb --hidden-import xlrd merger_studio.py
