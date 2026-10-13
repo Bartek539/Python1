@@ -1,0 +1,1103 @@
+"""
+Multi-Sheet Excel Merger Studio (v2.5 Enterprise Edition)
+
+Architecture:
+  - Engine Standard: pandas + openpyxl (high-throughput data aggregation, CSV mapping, row split).
+  - Engine Human: win32com (Excel COM automation, exact Ctrl+A -> Ctrl+C -> Ctrl+V emulation,
+    preserving formulas, conditional formatting, custom cell styles, and merged headers).
+  - UI Layer: tkinter + ttk (asynchronous worker thread, Queue-based event dispatch, HiDPI aware).
+"""
+from __future__ import annotations
+
+import csv
+import ctypes
+import io
+import json
+import logging
+import os
+import queue
+import re
+import sys
+import threading
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+APP_NAME = "ExcelMergerStudio"
+APP_VERSION = "2.5"
+
+# =============================================================================
+# 1. ŚCIEŻKI, LOGOWANIE I INTEGRACJA WINDOWS API
+# =============================================================================
+def get_base_dir() -> Path:
+    """Zwraca katalog nadrzędny pliku .py lub skompilowanego .exe."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def get_data_dir() -> Path:
+    """Zwraca bezpieczny katalog zapisu aplikacji w %LOCALAPPDATA%."""
+    root = os.environ.get("LOCALAPPDATA")
+    candidate = Path(root) / APP_NAME if root else get_base_dir()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        return get_base_dir()
+
+DATA_DIR = get_data_dir()
+LOG_FILE = DATA_DIR / "merger_system.log"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger(APP_NAME)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        try:
+            handler = RotatingFileHandler(
+                LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            )
+            logger.addHandler(handler)
+        except OSError:
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+log = setup_logging()
+
+def show_native_error(title: str, message: str) -> None:
+    """Wyświetla okno błędu WinAPI – działa nawet, gdy biblioteki GUI nie wystartują."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x10000)
+    except Exception:
+        if sys.stderr is not None:
+            sys.stderr.write(f"{title}: {message}\n")
+
+def enable_dpi_awareness() -> None:
+    """Wymusza ostre czcionki na ekranach wysokiej rozdzielczości (HiDPI / Skalowanie Windows)."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+# Bezpieczny import bibliotek GUI i analitycznych
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    import pandas as pd
+    import openpyxl  # noqa: F401
+except Exception as exc:
+    log.critical("Startup Import Error:\n%s", traceback.format_exc())
+    show_native_error("Błąd uruchomienia", f"Nie udało się załadować bibliotek bazowych:\n\n{exc}")
+    sys.exit(1)
+
+
+# =============================================================================
+# 2. MODELE DANYCH I STAŁE
+# =============================================================================
+SUPPORTED_EXTS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".csv"}
+OUTPUT_PREFIX = "merged_output_"
+REPORT_PREFIX = "merged_report_"
+SOURCE_COL = "_Source_File"
+DEFAULT_CSV_SHEET = "Data"
+HEADER_MATCH_THRESHOLD = 0.8
+EXCEL_MAX_DATA_ROWS = 1_048_575
+CSV_ENCODINGS = ("utf-8-sig", "cp1250", "latin-1")
+
+_BAD_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+ProgressCb = Callable[[int, int, str], None]
+
+@dataclass
+class MergeOptions:
+    input_dir: Path
+    output_dir: Path
+    order_file: Optional[Path] = None
+    skip_top: int = 0
+    skip_bottom: int = 0
+    add_source_column: bool = False
+    merge_like_human: bool = False
+
+@dataclass
+class SheetStat:
+    file: str = ""
+    sheet: str = ""
+    is_csv: bool = False
+    raw: int = 0
+    top: int = 0
+    header: int = 0
+    empty: int = 0
+    footer: int = 0
+    kept: int = 0
+
+@dataclass
+class Record:
+    key: Optional[str]
+    display: str
+    df: pd.DataFrame
+    file: str
+    stat: SheetStat
+    method: str = ""
+
+@dataclass
+class MergeResult:
+    output_file: Optional[Path] = None
+    report_file: Optional[Path] = None
+    files_total: int = 0
+    files_ok: int = 0
+    sheets: int = 0
+    rows: int = 0
+    cancelled: bool = False
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    stats: List[SheetStat] = field(default_factory=list)
+    out_sheets: List[Tuple[str, int]] = field(default_factory=list)
+    csv_assignments: List[Tuple[str, str, str]] = field(default_factory=list)
+
+    @property
+    def rows_read(self) -> int:
+        return sum(s.raw for s in self.stats)
+
+    @property
+    def removed_top(self) -> int:
+        return sum(s.top for s in self.stats)
+
+    @property
+    def removed_header(self) -> int:
+        return sum(s.header for s in self.stats)
+
+    @property
+    def removed_empty(self) -> int:
+        return sum(s.empty for s in self.stats)
+
+    @property
+    def removed_footer(self) -> int:
+        return sum(s.footer for s in self.stats)
+
+    @property
+    def rows_removed(self) -> int:
+        return self.removed_top + self.removed_header + self.removed_empty + self.removed_footer
+
+
+# =============================================================================
+# 3. POMOCNICZE FUNKCJE WEJŚCIA/WYJŚCIA I SORTOWANIA
+# =============================================================================
+def natural_key(text: str) -> list:
+    """Sortowanie naturalne zgodne z Windows Explorer (plik2 < plik10)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text.casefold())]
+
+def excel_engine(ext: str) -> str:
+    if ext in {".xlsx", ".xlsm"}:
+        return "openpyxl"
+    if ext == ".xlsb":
+        return "pyxlsb"
+    return "xlrd"
+
+def read_order_list(path: Path) -> List[str]:
+    """Wczytuje pierwszą kolumnę pliku definicji kolejności."""
+    ext = path.suffix.lower()
+    if ext in {".csv", ".txt"}:
+        for enc in CSV_ENCODINGS:
+            try:
+                text = path.read_text(encoding=enc)
+                codes = [re.split(r"[;\t,]", line)[0] for line in text.splitlines()]
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            raise ValueError(f"Nie udało się odczytać pliku kolejności: {path.name}")
+    else:
+        df = pd.read_excel(path, usecols=[0], header=None, dtype=str, engine=excel_engine(ext))
+        codes = df.iloc[:, 0].dropna().tolist()
+    cleaned = [str(c).strip().strip('"').strip() for c in codes]
+    return [c for c in cleaned if c]
+
+def sort_files(files: List[Path], codes: List[str]) -> Tuple[List[Path], List[str], List[Path]]:
+    """Sortuje pliki wejściowe według podanej listy kodów."""
+    lowered = [(i, c.casefold()) for i, c in enumerate(codes)]
+    used_codes: set = set()
+    ordered: List[Tuple[int, list, Path]] = []
+    rest: List[Path] = []
+
+    for p in files:
+        name = p.name.casefold()
+        hits = [(i, c) for i, c in lowered if c in name]
+        if hits:
+            best_idx, _ = max(hits, key=lambda h: (len(h[1]), -h[0]))
+            used_codes.add(best_idx)
+            ordered.append((best_idx, natural_key(p.name), p))
+        else:
+            rest.append(p)
+
+    ordered.sort(key=lambda t: (t[0], t[1]))
+    rest.sort(key=lambda p: natural_key(p.name))
+    unmatched = [codes[i] for i, _ in lowered if i not in used_codes]
+    return [t[2] for t in ordered] + rest, unmatched, rest
+
+def make_safe_sheet_names(names: List[str]) -> List[str]:
+    """Normalizuje nazwy arkuszy do wymogów specyfikacji Excela (max 31 znaków, brak znaków zakazanych)."""
+    used: set = set()
+    result: List[str] = []
+    for raw in names:
+        base = _BAD_SHEET_CHARS.sub("_", raw).strip("'").strip()[:31] or "Sheet"
+        candidate, i = base, 2
+        while candidate.casefold() in used:
+            suffix = f"~{i}"
+            candidate = base[: 31 - len(suffix)] + suffix
+            i += 1
+        used.add(candidate.casefold())
+        result.append(candidate)
+    return result
+
+
+# =============================================================================
+# 4. SILNIK A: "MERGE LIKE HUMAN" (Windows Excel COM Automation)
+# =============================================================================
+def merge_folder_like_human(
+    opts: MergeOptions,
+    files: List[Path],
+    progress: Optional[ProgressCb] = None,
+    cancel: Optional[threading.Event] = None,
+) -> MergeResult:
+    """
+    Kopiuje dane arkusz po arkuszu, odzwierciedlając pracę człowieka (Ctrl+A -> Ctrl+C -> PasteAll).
+    Zachowuje formuły, style, formatowanie liczb, kolory tła i szerokości kolumn.
+    Wymaga środowiska Windows i zainstalowanego pakietu Microsoft Excel.
+    """
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except ImportError as e:
+        raise RuntimeError("Brak biblioteki pywin32! Zainstaluj: pip install pywin32") from e
+
+    # Inicjalizacja COM w wątku roboczym (zapobiega crashowi wątkowości w Windows)
+    pythoncom.CoInitialize()
+
+    report: ProgressCb = progress or (lambda d, t, m: None)
+    res = MergeResult()
+    res.files_total = len(files)
+    total_steps = len(files) + 1
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = opts.output_dir / f"{OUTPUT_PREFIX}human_{stamp}.xlsx"
+
+    excel = None
+    target_wb = None
+
+    try:
+        try:
+            excel = win32.gencache.EnsureDispatch("Excel.Application")
+        except Exception:
+            excel = win32.Dispatch("Excel.Application")
+
+        # Optymalizacja wykonania i wyciszenie komunikatów Excela
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False
+        excel.CutCopyMode = False
+
+        sheet_tracker: Dict[str, Tuple[any, int]] = {}  # sheet_key -> (ws_reference, last_row)
+
+        target_wb = excel.Workbooks.Add()
+        default_sheet = target_wb.Worksheets(1)
+        default_sheet.Name = "__TEMP_INITIALIZER__"
+
+        for n, file_path in enumerate(files):
+            if cancel is not None and cancel.is_set():
+                res.cancelled = True
+                break
+
+            report(n, total_steps, f"[Tryb Human] Scalanie pliku {n + 1}/{len(files)}: {file_path.name}")
+            source_wb = None
+
+            try:
+                # Otwarcie pliku w trybie ReadOnly zapobiega blokadom i powiadomieniom
+                source_wb = excel.Workbooks.Open(
+                    str(file_path.resolve()), ReadOnly=True, UpdateLinks=0, IgnoreReadOnlyRecommended=True
+                )
+
+                for src_ws in source_wb.Worksheets:
+                    used_range = src_ws.UsedRange
+                    row_count = used_range.Rows.Count
+                    col_count = used_range.Columns.Count
+
+                    # Pomijamy arkusze całkowicie puste
+                    if row_count == 1 and col_count == 1 and used_range.Cells(1, 1).Value is None:
+                        continue
+
+                    raw_name = src_ws.Name.strip()
+                    sheet_key = raw_name.casefold()
+
+                    if sheet_key not in sheet_tracker:
+                        # Tworzymy nowy arkusz docelowy
+                        safe_name = _BAD_SHEET_CHARS.sub("_", raw_name)[:31] or "Sheet"
+                        target_ws = target_wb.Worksheets.Add(After=target_wb.Worksheets(target_wb.Worksheets.Count))
+                        try:
+                            target_ws.Name = safe_name
+                        except Exception:
+                            target_ws.Name = f"Sheet_{len(sheet_tracker) + 1}"
+
+                        # Kopiuj wszystko: Ctrl+A -> Ctrl+C -> xlPasteAll
+                        used_range.Copy()
+                        dest_cell = target_ws.Cells(1, 1)
+                        dest_cell.PasteSpecial(-4104)  # xlPasteAll
+                        try:
+                            dest_cell.PasteSpecial(8)      # xlPasteColumnWidths
+                        except Exception:
+                            pass
+
+                        excel.CutCopyMode = False
+                        sheet_tracker[sheet_key] = (target_ws, row_count)
+                        res.stats.append(SheetStat(file=file_path.name, sheet=raw_name, raw=row_count, kept=row_count))
+                    else:
+                        target_ws, current_last_row = sheet_tracker[sheet_key]
+                        start_paste_row = current_last_row + 1
+
+                        # Doklejanie danych poniżej poprzednich wpisów
+                        used_range.Copy()
+                        dest_cell = target_ws.Cells(start_paste_row, 1)
+                        dest_cell.PasteSpecial(-4104)  # xlPasteAll
+                        excel.CutCopyMode = False
+
+                        new_last_row = current_last_row + row_count
+                        sheet_tracker[sheet_key] = (target_ws, new_last_row)
+                        res.stats.append(SheetStat(file=file_path.name, sheet=raw_name, raw=row_count, kept=row_count))
+
+                source_wb.Close(SaveChanges=False)
+                res.files_ok += 1
+
+            except Exception as src_exc:
+                log.error("Błąd COM w pliku %s:\n%s", file_path.name, traceback.format_exc())
+                res.errors.append(f"{file_path.name}: {type(src_exc).__name__}: {src_exc}")
+                if source_wb:
+                    try:
+                        source_wb.Close(SaveChanges=False)
+                    except Exception:
+                        pass
+
+        # Usunięcie tymczasowego początkowego arkusza
+        try:
+            default_sheet.Delete()
+        except Exception:
+            pass
+
+        if not res.cancelled and sheet_tracker:
+            report(len(files), total_steps, "Zapisywanie wynikowego pliku Excel...")
+            # 51 = xlOpenXMLWorkbook (.xlsx)
+            target_wb.SaveAs(str(output_file.resolve()), FileFormat=51)
+            res.output_file = output_file
+            res.sheets = len(sheet_tracker)
+            res.rows = sum(st.kept for st in res.stats)
+            res.out_sheets = [(ws.Name, last_r) for _, (ws, last_r) in sheet_tracker.items()]
+
+    finally:
+        # Pancerne sprzątanie zasobów COM zapobiegające powstawaniu procesów zombie
+        if target_wb:
+            try:
+                target_wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.CutCopyMode = False
+                excel.ScreenUpdating = True
+                excel.DisplayAlerts = True
+                excel.Quit()
+            except Exception:
+                pass
+        del target_wb
+        del excel
+        pythoncom.CoUninitialize()
+
+    return res
+
+
+# =============================================================================
+# 5. SILNIK B: STANDARD ENGINE (Wysokowydajny Pandas / OpenPyXL)
+# =============================================================================
+def _read_text_any_encoding(path: Path) -> str:
+    for enc in CSV_ENCODINGS:
+        try:
+            with open(path, "r", encoding=enc, newline="") as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Nie udało się rozpoznać kodowania pliku {path.name}")
+
+def _sniff_delimiter(text: str) -> str:
+    sample = text[:50_000]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        lines = sample.splitlines()
+        first = lines[0] if lines else ""
+        return max(",;\t|", key=first.count) if first else ","
+
+def read_csv_raw(path: Path) -> pd.DataFrame:
+    text = _read_text_any_encoding(path)
+    if not text.strip():
+        return pd.DataFrame()
+    delim = _sniff_delimiter(text)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delim)
+    ncols = max((len(r) for r in reader), default=0)
+    if ncols == 0:
+        return pd.DataFrame()
+    return pd.read_csv(
+        io.StringIO(text, newline=""),
+        sep=delim,
+        header=None,
+        names=list(range(ncols)),
+        dtype=str,
+        engine="python",
+        skip_blank_lines=False,
+    )
+
+def read_workbook(path: Path) -> List[Tuple[Optional[str], pd.DataFrame]]:
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        return [(None, read_csv_raw(path))]
+    result: List[Tuple[Optional[str], pd.DataFrame]] = []
+    with pd.ExcelFile(path, engine=excel_engine(ext)) as xls:
+        for name in xls.sheet_names:
+            result.append((str(name), xls.parse(name, header=None)))
+    return result
+
+def dedupe_columns(cols: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+def header_text(value, idx: int) -> str:
+    try:
+        if pd.isna(value):
+            return f"Unnamed: {idx}"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return re.sub(r"\s+", " ", str(value)).strip() or f"Unnamed: {idx}"
+
+def numeric_where_possible(df: pd.DataFrame) -> pd.DataFrame:
+    if df.shape[1] == 0:
+        return df
+    cols = {}
+    for i, name in enumerate(df.columns):
+        series = df.iloc[:, i]
+        try:
+            series = pd.to_numeric(series)
+        except (ValueError, TypeError):
+            pass
+        cols[name] = series
+    return pd.DataFrame(cols, index=df.index)
+
+def process_raw(
+    raw: pd.DataFrame, skip_top: int, skip_bottom: int, from_csv: bool
+) -> Tuple[pd.DataFrame, SheetStat]:
+    st = SheetStat(raw=len(raw), is_csv=from_csv)
+    nothing = pd.DataFrame()
+
+    st.top = min(skip_top, len(raw))
+    rest = raw.iloc[st.top:]
+    if rest.empty:
+        return nothing, st
+
+    blank = rest.isna().all(axis=1).to_numpy()
+    filled_pos = (~blank).nonzero()[0]
+    if len(filled_pos) == 0:
+        st.empty = len(rest)
+        return nothing, st
+
+    h = int(filled_pos[0])
+    st.empty = h
+    st.header = 1
+    header_vals = rest.iloc[h].tolist()
+
+    body = rest.iloc[h + 1:]
+    body_filled = body.dropna(how="all")
+    st.empty += len(body) - len(body_filled)
+    body = body_filled
+
+    keep = [
+        i for i, v in enumerate(header_vals)
+        if not (pd.isna(v) and body.iloc[:, i].isna().all())
+    ]
+    names = dedupe_columns([header_text(header_vals[i], i) for i in keep])
+    body = body.iloc[:, keep].copy()
+    body.columns = names
+
+    cut = min(skip_bottom, len(body)) if skip_bottom > 0 else 0
+    if cut:
+        body = body.iloc[:-cut]
+        st.footer = cut
+
+    body = numeric_where_possible(body) if from_csv else body.infer_objects()
+    body = body.reset_index(drop=True)
+    st.kept = len(body)
+    return body, st
+
+def sanitize_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    obj_cols = [c for c in df.columns if df[c].dtype.kind == "O"]
+    if not obj_cols:
+        return df
+    df = df.copy()
+    for c in obj_cols:
+        df[c] = df[c].map(lambda v: _ILLEGAL_XML.sub("", v) if isinstance(v, str) else v)
+    return df
+
+def format_sheet(ws, df: pd.DataFrame) -> None:
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    if df.shape[1] == 0:
+        return
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    bold = Font(bold=True)
+    for idx, col in enumerate(df.columns, start=1):
+        ws.cell(row=1, column=idx).font = bold
+        longest = max([len(str(col))] + [len(str(v)) if not pd.isna(v) else 0 for v in df[col].head(500)])
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(10, longest + 2), 50)
+
+def column_set(df: pd.DataFrame) -> Set[str]:
+    return {str(c).casefold() for c in df.columns if c != SOURCE_COL}
+
+def match_by_file_name(stem: str, known: Dict[str, str]) -> Optional[str]:
+    text = stem.casefold()
+    best: Optional[str] = None
+    for key in known:
+        if not key:
+            continue
+        pattern = r"(?<![^\W_])" + re.escape(key) + r"(?![^\W_])"
+        if re.search(pattern, text) and (best is None or len(key) > len(best)):
+            best = key
+    return best
+
+def match_by_headers(cols: Set[str], sheet_cols: Dict[str, Set[str]]) -> Optional[str]:
+    best_key: Optional[str] = None
+    best_score = 0.0
+    for key, other in sheet_cols.items():
+        union = len(cols | other)
+        score = len(cols & other) / union if union else 0.0
+        if score > best_score:
+            best_key, best_score = key, score
+    return best_key if best_score >= HEADER_MATCH_THRESHOLD else None
+
+def group_sheet_name(stems: List[str]) -> str:
+    base = os.path.commonprefix(stems) if len(stems) > 1 else stems[0]
+    base = re.sub(r"[\W_]*\d[\d\W_]*$", "", base)
+    base = re.sub(r"[\W_\d]+$", "", base)
+    base = re.sub(r"^[\W_]+", "", base).strip()
+    return base or DEFAULT_CSV_SHEET
+
+def assign_csv_records(records: List[Record], res: MergeResult) -> None:
+    known: Dict[str, str] = {}
+    sheet_cols: Dict[str, Set[str]] = {}
+    for r in records:
+        if r.key is not None:
+            known.setdefault(r.key, r.display)
+            sheet_cols.setdefault(r.key, set()).update(column_set(r.df))
+
+    pending: Dict[frozenset, List[Record]] = {}
+    for r in records:
+        if r.key is not None:
+            continue
+        key = match_by_file_name(Path(r.file).stem, known)
+        method = "nazwa pliku"
+        if key is None:
+            key = match_by_headers(column_set(r.df), sheet_cols)
+            method = "zgodność nagłówków"
+        if key is not None:
+            r.key, r.display, r.method = key, known[key], method
+        else:
+            pending.setdefault(frozenset(column_set(r.df)), []).append(r)
+
+    for group in pending.values():
+        name = group_sheet_name([Path(r.file).stem for r in group])
+        key = name.casefold()
+        known.setdefault(key, name)
+        for r in group:
+            r.key, r.display, r.method = key, known[key], "nowy arkusz"
+        files = ", ".join(r.file for r in group[:3]) + (" …" if len(group) > 3 else "")
+        res.warnings.append(
+            f"Pliki CSV bez bezpośredniego dopasowania arkusza ({files}) przypisano do nowego arkusza '{known[key]}'."
+        )
+
+    for r in records:
+        if r.stat.is_csv:
+            r.stat.sheet = f"{r.display} (CSV)"
+    res.csv_assignments = [
+        (r.file, r.display, r.method) for r in records if r.stat.is_csv and r.method
+    ]
+
+
+# =============================================================================
+# 6. GENEROWANIE RAPORTU PODSUMOWUJĄCEGO
+# =============================================================================
+def build_report(res: MergeResult, opts: MergeOptions, generated: datetime) -> str:
+    bar = "=" * 80
+    thin = "-" * 80
+    out_name = res.output_file.name if res.output_file else "-"
+    n = lambda v: f"{v:,}"
+
+    L: List[str] = [
+        bar,
+        f"{APP_NAME} v{APP_VERSION} - RAPORT PODSUMOWANIA SCALANIA",
+        bar,
+        f"Data wygenerowania: {generated:%Y-%m-%d %H:%M:%S}",
+        f"Zastosowany tryb  : {'Merge Like Human (COM Automation)' if opts.merge_like_human else 'Standard (Pandas / OpenPyXL)'}",
+        f"Katalog wejściowy : {opts.input_dir}",
+        f"Katalog docelowy  : {opts.output_dir}",
+        f"Plik wynikowy     : {out_name}",
+        f"Status plików     : {res.files_ok} / {res.files_total} przetworzonych pomyślnie",
+        f"Arkusze w pliku   : {res.sheets}",
+        "",
+        thin,
+        "ZESTAWIENIE WIERSZY",
+        thin,
+        f"Wiersze odczytane łącznie  : {n(res.rows_read):>16}",
+        f"Wiersze pominięte/usunięte : {n(res.rows_removed):>16}",
+        f"Wiersze w pliku wyjściowym : {n(res.rows):>16}",
+        "",
+    ]
+    if res.out_sheets:
+        L += [thin, "ROZKŁAD ARKUSZY WYNIKOWYCH", thin]
+        w = max(len(name) for name, _ in res.out_sheets)
+        for name, count in res.out_sheets:
+            L.append(f"  {name.ljust(w)}  {n(count):>12} wierszy")
+
+    if res.errors:
+        L += ["", thin, f"BŁĘDY ({len(res.errors)})", thin]
+        L += [f"  * {e}" for e in res.errors]
+    if res.warnings:
+        L += ["", thin, f"OSTRZEŻENIA ({len(res.warnings)})", thin]
+        L += [f"  * {w}" for w in res.warnings]
+
+    L.append("")
+    return "\n".join(L)
+
+
+# =============================================================================
+# 7. DYSPOZYTOR GŁÓWNY (MERGE PIPELINE)
+# =============================================================================
+def merge_folder(
+    opts: MergeOptions,
+    progress: Optional[ProgressCb] = None,
+    cancel: Optional[threading.Event] = None,
+) -> MergeResult:
+    report: ProgressCb = progress or (lambda done, total, msg: None)
+
+    if not opts.input_dir.is_dir():
+        raise ValueError("Wskazany folder wejściowy nie istnieje.")
+    if not opts.output_dir.is_dir():
+        raise ValueError("Wskazany folder wyjściowy nie istnieje.")
+
+    files = [
+        p for p in opts.input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS and not p.name.startswith(("~$", OUTPUT_PREFIX))
+    ]
+    if not files:
+        raise ValueError("Nie znaleziono obsługiwanych plików Excel ani CSV w katalogu.")
+
+    codes: List[str] = []
+    if opts.order_file:
+        try:
+            codes = read_order_list(opts.order_file)
+        except Exception as exc:
+            log.warning("Nie można odczytać pliku kolejności: %s", exc)
+
+    if codes:
+        files, _, _ = sort_files(files, codes)
+    else:
+        files.sort(key=lambda p: natural_key(p.name))
+
+    # --- PRZEKIEROWANIE DO WYBRANEGO SILNIKA ---
+    if opts.merge_like_human:
+        res = merge_folder_like_human(opts, files, progress, cancel)
+    else:
+        res = MergeResult()
+        res.files_total = len(files)
+        total_steps = len(files) + 1
+        records: List[Record] = []
+
+        for n, path in enumerate(files):
+            if cancel is not None and cancel.is_set():
+                res.cancelled = True
+                return res
+            report(n, total_steps, f"Wczytywanie {n + 1}/{len(files)}: {path.name}")
+            try:
+                local_records: List[Record] = []
+                local_stats: List[SheetStat] = []
+                for sheet_name, raw in read_workbook(path):
+                    is_csv = sheet_name is None
+                    df, st = process_raw(raw, opts.skip_top, opts.skip_bottom, from_csv=is_csv)
+                    st.file = path.name
+                    st.sheet = "" if is_csv else sheet_name.strip()
+                    local_stats.append(st)
+                    if df.empty:
+                        continue
+                    if opts.add_source_column and SOURCE_COL not in df.columns:
+                        df.insert(0, SOURCE_COL, path.name)
+                    if is_csv:
+                        local_records.append(Record(None, "", df, path.name, st))
+                    else:
+                        name = sheet_name.strip()
+                        local_records.append(Record(name.casefold(), name, df, path.name, st))
+
+                res.stats.extend(local_stats)
+                records.extend(local_records)
+                res.files_ok += 1
+            except Exception as exc:
+                log.error("Błąd w pliku %s:\n%s", path.name, traceback.format_exc())
+                res.errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+
+        if not records:
+            raise ValueError("Brak danych tabelarycznych do połączenia po odfiltrowaniu.")
+
+        assign_csv_records(records, res)
+
+        sheets: Dict[str, Tuple[str, List[pd.DataFrame]]] = {}
+        for r in records:
+            sheets.setdefault(r.key, (r.display, []))[1].append(r.df)
+
+        parts: List[Tuple[str, pd.DataFrame]] = []
+        for display, frames in sheets.values():
+            merged = pd.concat(frames, ignore_index=True, sort=False)
+            if len(merged) > EXCEL_MAX_DATA_ROWS:
+                for k, start in enumerate(range(0, len(merged), EXCEL_MAX_DATA_ROWS), start=1):
+                    parts.append((f"{display} ({k})", merged.iloc[start : start + EXCEL_MAX_DATA_ROWS]))
+            else:
+                parts.append((display, merged))
+
+        safe_names = make_safe_sheet_names([name for name, _ in parts])
+        now = datetime.now()
+        stamp = now.strftime("%Y%m%d_%H%M%S")
+        output_file = opts.output_dir / f"{OUTPUT_PREFIX}{stamp}.xlsx"
+        tmp_file = output_file.with_name(output_file.stem + ".tmp.xlsx")
+
+        report(len(files), total_steps, "Zapisywanie pliku docelowego...")
+        try:
+            with pd.ExcelWriter(tmp_file, engine="openpyxl") as writer:
+                for (_, df), name in zip(parts, safe_names):
+                    df = sanitize_for_excel(df)
+                    df.to_excel(writer, sheet_name=name, index=False)
+                    try:
+                        format_sheet(writer.sheets[name], df)
+                    except Exception:
+                        pass
+            os.replace(tmp_file, output_file)
+        except Exception:
+            tmp_file.unlink(missing_ok=True)
+            raise
+
+        res.output_file = output_file
+        res.sheets = len(parts)
+        res.rows = sum(len(df) for _, df in parts)
+        res.out_sheets = [(name, len(df)) for (_, df), name in zip(parts, safe_names)]
+
+    # --- ZAPIS RAPORTU PLIKOWEGO ---
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    report_file = opts.output_dir / f"{REPORT_PREFIX}{stamp}.txt"
+    try:
+        report_file.write_text(build_report(res, opts, now), encoding="utf-8-sig")
+        res.report_file = report_file
+    except OSError as exc:
+        res.warnings.append(f"Nie udało się zapisać pliku raportu TXT: {exc}")
+
+    report(len(files) + 1, len(files) + 1, "Zakończono")
+    return res
+
+
+# =============================================================================
+# 8. INTERFEJS UŻYTKOWNIKA (GUI - TKINTER)
+# =============================================================================
+class MergerApp(tk.Tk):
+    BG = "#F5F5F7"
+    FG = "#1D1D1F"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(f"Multi-Sheet Excel Merger Studio v{APP_VERSION}")
+        self.geometry("730x700")
+        self.minsize(680, 660)
+        self.configure(bg=self.BG)
+
+        self._events: queue.Queue[tuple] = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+
+        self._setup_styles()
+        self._build_ui()
+        self._load_settings()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._poll_events)
+
+    def _setup_styles(self) -> None:
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        st.configure("TLabel", background=self.BG, foreground=self.FG, font=("Segoe UI", 9))
+        st.configure("TCheckbutton", background=self.BG, foreground=self.FG, font=("Segoe UI", 9))
+        st.configure("Human.TCheckbutton", background="#FFF2D6", foreground="#7A4100", font=("Segoe UI", 9, "bold"))
+        st.configure("TEntry", fieldbackground="#FFFFFF", padding=4)
+        st.configure("TSpinbox", fieldbackground="#FFFFFF", padding=3)
+        st.configure("Browse.TButton", font=("Segoe UI", 9), background="#0071E3",
+                     foreground="white", borderwidth=0, focuscolor="none", padding=(10, 4))
+        st.map("Browse.TButton",
+               background=[("active", "#0077ED"), ("disabled", "#D2D2D7")],
+               foreground=[("disabled", "#86868B")])
+        st.configure("Run.TButton", font=("Segoe UI", 10, "bold"), background="#28CD41",
+                     foreground="white", borderwidth=0, focuscolor="none", padding=(14, 8))
+        st.map("Run.TButton",
+               background=[("active", "#24B338"), ("disabled", "#D2D2D7")],
+               foreground=[("disabled", "#86868B")])
+        st.configure("Cancel.TButton", font=("Segoe UI", 10), background="#FF5F56",
+                     foreground="white", borderwidth=0, focuscolor="none", padding=(14, 8))
+        st.map("Cancel.TButton",
+               background=[("active", "#E0443E"), ("disabled", "#D2D2D7")],
+               foreground=[("disabled", "#86868B")])
+        st.configure("Horizontal.TProgressbar", troughcolor="#E8E8ED", background="#0071E3")
+
+    def _build_ui(self) -> None:
+        self.var_input = tk.StringVar()
+        self.var_order = tk.StringVar()
+        self.var_output = tk.StringVar()
+        self.var_top = tk.StringVar(value="0")
+        self.var_bottom = tk.StringVar(value="0")
+        self.var_source = tk.BooleanVar(value=False)
+        self.var_open = tk.BooleanVar(value=True)
+        self.var_human = tk.BooleanVar(value=False)
+
+        self._persisted = {
+            "input": self.var_input, "order": self.var_order, "output": self.var_output,
+            "top": self.var_top, "bottom": self.var_bottom,
+            "source": self.var_source, "open": self.var_open, "human": self.var_human
+        }
+
+        content = tk.Frame(self, bg=self.BG)
+        content.pack(fill="both", expand=True, padx=25, pady=(12, 4))
+        content.columnconfigure(0, weight=1)
+
+        self._path_row(content, 0, "1. Katalog wejściowy (pliki do scalenia):",
+                       self.var_input, lambda: self._browse_dir(self.var_input, "Wybierz folder wejściowy"))
+        self._path_row(content, 1, "2. Plik kolejności (opcjonalny, kody w kolumnie A):",
+                       self.var_order, self._browse_order)
+        self._path_row(content, 2, "3. Katalog wyjściowy (zapis wyniku):",
+                       self.var_output, lambda: self._browse_dir(self.var_output, "Wybierz folder docelowy"))
+
+        # Sekcja trybu "Merge Like Human"
+        human_frame = tk.LabelFrame(content, text=" Zaawansowany tryb scalania ", bg="#FFF8E7", fg="#7A4100",
+                                    font=("Segoe UI", 9, "bold"), padx=10, pady=6)
+        human_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        human_chk = ttk.Checkbutton(
+            human_frame,
+            text="✨ Merge like human (Kopiuj jak człowiek: zachowaj formuły, formaty komórek, kolory i nagłówki)",
+            variable=self.var_human,
+            style="Human.TCheckbutton"
+        )
+        human_chk.pack(anchor="w")
+        ttk.Label(
+            human_frame,
+            text="Symulacja Ctrl+A -> Ctrl+C -> Wklej wszystko przez Excel COM. Zachowuje 100% stylów źródłowych.",
+            foreground="#8A6D3B",
+            font=("Segoe UI", 8)
+        ).pack(anchor="w", padx=20)
+
+        # Sekcja parametrów czyszczenia (Tryb Standardowy)
+        opts = tk.LabelFrame(content, text=" Opcje czyszczenia wierszy (tylko tryb standardowy) ",
+                             bg=self.BG, fg=self.FG, font=("Segoe UI", 9, "bold"), padx=10, pady=8)
+        opts.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        opts.columnconfigure(0, weight=1)
+        opts.columnconfigure(1, weight=1)
+        vcmd = (self.register(lambda v: v == "" or v.isdigit()), "%P")
+
+        ttk.Label(opts, text="Pomiń wiersze od góry (przed nagłówkiem):").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(opts, from_=0, to=9999, width=10, textvariable=self.var_top,
+                    validate="key", validatecommand=vcmd).grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(2, 0))
+        ttk.Label(opts, text="Pomiń wiersze od dołu (stopka / podsumowania):").grid(row=0, column=1, sticky="w")
+        ttk.Spinbox(opts, from_=0, to=9999, width=10, textvariable=self.var_bottom,
+                    validate="key", validatecommand=vcmd).grid(row=1, column=1, sticky="ew", pady=(2, 0))
+
+        flags = tk.Frame(content, bg=self.BG)
+        flags.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(flags, text="Dodaj kolumnę ze ścieżką pliku źródłowego (_Source_File)",
+                        variable=self.var_source).pack(anchor="w")
+        ttk.Checkbutton(flags, text="Otwórz katalog wynikowy po zakończeniu pracy",
+                        variable=self.var_open).pack(anchor="w")
+
+        buttons = tk.Frame(self, bg=self.BG)
+        buttons.pack(pady=(8, 6))
+        self.btn_run = ttk.Button(buttons, text="URUCHOM SCALANIE", style="Run.TButton", command=self._start)
+        self.btn_run.pack(side="left", padx=4)
+        self.btn_cancel = ttk.Button(buttons, text="Anuluj", style="Cancel.TButton", command=self._cancel, state=tk.DISABLED)
+        self.btn_cancel.pack(side="left", padx=4)
+
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=25, pady=(4, 4))
+        self.lbl_status = tk.Label(self, text="Gotowy do pracy", bg=self.BG, fg="#86868B",
+                                   font=("Segoe UI", 9, "bold"), wraplength=660, justify="center")
+        self.lbl_status.pack(pady=(0, 10))
+
+    def _path_row(self, parent: tk.Frame, idx: int, label: str, var: tk.StringVar, command) -> None:
+        ttk.Label(parent, text=label).grid(row=idx * 2, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Entry(parent, textvariable=var).grid(row=idx * 2 + 1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(parent, text="Przeglądaj…", style="Browse.TButton", command=command).grid(row=idx * 2 + 1, column=1)
+
+    def _browse_dir(self, var: tk.StringVar, title: str) -> None:
+        path = filedialog.askdirectory(title=title, initialdir=var.get() or None)
+        if path:
+            var.set(str(Path(path)))
+
+    def _browse_order(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Wybierz plik definiujący kolejność",
+            filetypes=[("Arkusze Excel / Pliki CSV", "*.xlsx *.xlsm *.xlsb *.xls *.csv"), ("Wszystkie pliki", "*.*")],
+        )
+        if path:
+            self.var_order.set(str(Path(path)))
+
+    def _load_settings(self) -> None:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for key, var in self._persisted.items():
+            if key in data:
+                try:
+                    var.set(data[key])
+                except tk.TclError:
+                    pass
+
+    def _save_settings(self) -> None:
+        try:
+            data = {k: v.get() for k, v in self._persisted.items()}
+            SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, tk.TclError):
+            pass
+
+    def _set_running(self, running: bool) -> None:
+        self.btn_run.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.btn_cancel.config(state=tk.NORMAL if running else tk.DISABLED)
+
+    def _set_status(self, text: str, color: str) -> None:
+        self.lbl_status.config(text=text, fg=color)
+
+    @staticmethod
+    def _to_int(value: str) -> int:
+        return int(value) if value.strip().isdigit() else 0
+
+    def _start(self) -> None:
+        input_dir = self.var_input.get().strip()
+        output_dir = self.var_output.get().strip()
+        if not input_dir or not output_dir:
+            self._set_status("Błąd: Katalogi wejściowy i wyjściowy muszą zostać określone.", "#D70015")
+            return
+
+        order = self.var_order.get().strip()
+        opts = MergeOptions(
+            input_dir=Path(input_dir),
+            output_dir=Path(output_dir),
+            order_file=Path(order) if order else None,
+            skip_top=self._to_int(self.var_top.get()),
+            skip_bottom=self._to_int(self.var_bottom.get()),
+            add_source_column=self.var_source.get(),
+            merge_like_human=self.var_human.get(),
+        )
+        self._save_settings()
+        self._cancel_event.clear()
+        self._set_running(True)
+        self.progress.config(value=0)
+        self._set_status("Przetwarzanie danych w toku... Proszę czekać.", "#0071E3")
+        self._worker = threading.Thread(target=self._worker_main, args=(opts,), daemon=True)
+        self._worker.start()
+
+    def _cancel(self) -> None:
+        self._cancel_event.set()
+        self._set_status("Wycofywanie operacji...", "#86868B")
+
+    def _worker_main(self, opts: MergeOptions) -> None:
+        try:
+            result = merge_folder(
+                opts,
+                progress=lambda d, t, m: self._events.put(("progress", d, t, m)),
+                cancel=self._cancel_event,
+            )
+            self._events.put(("done", result))
+        except PermissionError:
+            self._events.put(("error", "Odmowa dostępu do pliku. Upewnij się, że skoroszyt docelowy jest zamknięty w Excelu."))
+        except Exception as exc:
+            log.error("Błąd procesu scalania:\n%s", traceback.format_exc())
+            self._events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event = self._events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    _, done, total, msg = event
+                    self.progress.config(value=100 * done / max(total, 1))
+                    self._set_status(msg, "#0071E3")
+                elif kind == "done":
+                    self._on_done(event[1])
+                elif kind == "error":
+                    self._set_running(False)
+                    self.progress.config(value=0)
+                    self._set_status(f"Błąd operacji: {event[1]}", "#D70015")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_events)
+
+    def _on_done(self, res: MergeResult) -> None:
+        self._set_running(False)
+        if res.cancelled:
+            self.progress.config(value=0)
+            self._set_status("Operacja anulowana przez użytkownika.", "#86868B")
+            return
+
+        self.progress.config(value=100)
+        out_name = res.output_file.name if res.output_file else ""
+        msg = f"Sukces! Scalono plików: {res.files_ok}/{res.files_total}. Arkuszy: {res.sheets}\nPlik docelowy: {out_name}"
+        self._set_status(msg, "#28CD41" if not res.errors else "#FF9500")
+
+        if res.errors or res.warnings:
+            info = "\n".join(res.errors + res.warnings)
+            messagebox.showwarning("Raport ostrzeżeń scalania", info)
+
+        if self.var_open.get() and res.output_file and hasattr(os, "startfile"):
+            try:
+                os.startfile(res.output_file.parent)
+            except OSError:
+                pass
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        self._cancel_event.set()
+        self.destroy()
+
+def main() -> None:
+    try:
+        enable_dpi_awareness()
+        app = MergerApp()
+        log.info("Pętla główna GUI uruchomiona.")
+        app.mainloop()
+    except Exception as exc:
+        log.critical("FATAL CRASH:\n%s", traceback.format_exc())
+        show_native_error("Błąd krytyczny aplikacji", f"Aplikacja napotkała błąd nieodwracalny:\n\n{exc}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
