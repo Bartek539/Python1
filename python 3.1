@@ -1,0 +1,1941 @@
+"""
+Multi-Sheet Excel Merger Studio  (v3.1)
+
+Merges .xlsx / .xlsm / .xlsb / .xls / .csv files from one folder into a single
+workbook, sheet by sheet: data from sheets with the same name is stacked on top
+of each other, regardless of whether it comes from an Excel file or a CSV file.
+
+SHEET NAME MATCHING
+-------------------
+Only the LETTERS of a sheet name count; digits are ignored (case-insensitive,
+spaces / punctuation are ignored too). "Fund6789", "Fund5678" and "FUND 12" all
+land in one output sheet named "Fund". A name without any letters (e.g. "2024")
+is matched by its full text instead.
+
+TWO MERGE ENGINES
+-----------------
+1. Standard (pandas + openpyxl)
+   Fast, data-only merge. Finds the header row, removes empty rows, can skip
+   rows at the top / bottom of every sheet and can add a source-file column.
+   Formulas and formatting are NOT preserved (values only).
+
+2. "Merge like human" (Microsoft Excel through COM, Windows only)
+   Does what a person does with Ctrl+A -> Ctrl+C -> Ctrl+V: whole sheets are
+   copied cell for cell into the output workbook. NOTHING is removed - all
+   headers, formulas, number formats, colours, borders, merged cells,
+   conditional formatting and column widths are kept. Requires desktop Excel
+   and the `pywin32` package. A private, invisible Excel instance is used, so
+   an Excel window you already have open is never touched.
+
+CSV FILES
+---------
+A CSV file has no sheet name, so the program decides where it belongs
+(in this order):
+  1. FILE NAME  - the file name contains the name of a sheet found in the Excel
+                  files ("Report_Sales.csv" -> sheet "Sales"; longest name wins).
+  2. HEADERS    - the CSV columns match the columns of an Excel sheet (>= 80 %).
+  3. NEW SHEET  - otherwise CSV files with identical columns are grouped into a
+                  new sheet named after the common part of their file names.
+Every decision is written to the TXT report.
+(In "Merge like human" mode CSV files are appended after the Excel files.)
+
+After every merge a TXT report is written next to the output file: rows read,
+rows removed (with a breakdown) and rows in the output, plus a balance check.
+
+Required : pandas, openpyxl
+Optional : xlrd (.xls), pyxlsb (.xlsb), pywin32 ("Merge like human" mode)
+"""
+from __future__ import annotations
+
+import csv
+import ctypes
+import gc
+import io
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+APP_NAME = "ExcelMergerStudio"
+APP_VERSION = "3.1"
+
+
+# =============================================================================
+# 1. PATHS, LOGGING, SYSTEM HELPERS
+# =============================================================================
+def _fix_missing_stdio() -> None:
+    """With PyInstaller --noconsole, sys.stdout / sys.stderr are None."""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+_fix_missing_stdio()
+
+
+def get_base_dir() -> Path:
+    """Directory of the .exe (PyInstaller) or of the .py script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_data_dir() -> Path:
+    """Writable directory for app data (log, settings): %LOCALAPPDATA%\\ExcelMergerStudio."""
+    root = os.environ.get("LOCALAPPDATA")
+    candidate = Path(root) / APP_NAME if root else get_base_dir()
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except OSError:
+        return get_base_dir()
+
+
+DATA_DIR = get_data_dir()
+LOG_FILE = DATA_DIR / "merger_system.log"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger(APP_NAME)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        try:
+            handler = RotatingFileHandler(
+                LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            )
+            logger.addHandler(handler)
+        except OSError:
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+
+log = setup_logging()
+
+
+def error_location(exc: BaseException) -> str:
+    """Where did it fail? Last frame in this script + innermost frame (e.g. inside pandas)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return ""
+    own = [f for f in frames if os.path.abspath(f.filename) == os.path.abspath(__file__)]
+    parts = []
+    if own:
+        parts.append(f"{own[-1].name}() line {own[-1].lineno}")
+    last = frames[-1]
+    if not own or last is not own[-1]:
+        parts.append(f"{Path(last.filename).name}:{last.lineno} {last.name}()")
+    return " -> ".join(parts)
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Readable error text (COM errors carry the useful message in `excepinfo`)."""
+    info = getattr(exc, "excepinfo", None)
+    if info and len(info) > 2 and info[2]:
+        return f"{type(exc).__name__}: {info[2]}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def show_native_error(title: str, message: str) -> None:
+    """WinAPI error box - works even if Tkinter fails to load."""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x10000)
+    except Exception:
+        sys.stderr.write(f"{title}: {message}\n")
+
+
+def enable_dpi_awareness() -> None:
+    """Sharp text on HiDPI screens (must be called before creating Tk)."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def open_path(path: Path) -> None:
+    """Open a file or folder with the default application."""
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:  # noqa: BLE001
+        log.warning("Could not open %s", path)
+
+
+log.info("=== APPLICATION INITIALIZATION STARTED (v%s) ===", APP_VERSION)
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    import pandas as pd
+    import openpyxl  # noqa: F401  (required by pandas for .xlsx; importing = fail early)
+
+    log.info("Core libraries imported successfully.")
+except Exception as exc:  # noqa: BLE001
+    log.error("Import failed:\n%s", traceback.format_exc())
+    show_native_error(
+        "Startup Error",
+        f"Failed to load required libraries:\n\n{exc}\n\nDetails: {LOG_FILE}",
+    )
+    sys.exit(1)
+
+
+# =============================================================================
+# 2. CONSTANTS AND DATA MODELS
+# =============================================================================
+SUPPORTED_EXTS = {".xlsx", ".xlsm", ".xlsb", ".xls", ".csv"}
+OUTPUT_PREFIX = "merged_output_"
+REPORT_PREFIX = "merged_report_"
+SOURCE_COL = "_Source_File"
+DEFAULT_CSV_SHEET = "Data"
+HEADER_MATCH_THRESHOLD = 0.8      # min. column overlap (Jaccard) to attach a CSV to an Excel sheet
+EXCEL_MAX_ROWS = 1_048_576        # physical Excel row limit
+EXCEL_MAX_DATA_ROWS = EXCEL_MAX_ROWS - 1   # standard mode: one header row per sheet
+CSV_ENCODINGS = ("utf-8-sig", "cp1250", "latin-1")
+
+# Excel COM constants
+XL_CALC_MANUAL = -4135
+XL_CALC_AUTOMATIC = -4105
+XL_OPEN_XML_WORKBOOK = 51
+MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
+MAX_WIDTH_COLUMNS = 1000
+
+_BAD_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_PLAIN_NUMBER = re.compile(r"-?(0|[1-9]\d*)(\.\d+)?")
+
+ProgressCb = Callable[[int, int, str], None]
+
+
+@dataclass
+class MergeOptions:
+    input_dir: Path
+    output_dir: Path
+    order_file: Optional[Path] = None
+    skip_top: int = 0
+    skip_bottom: int = 0
+    add_source_column: bool = False
+    merge_like_human: bool = False
+
+
+@dataclass
+class SheetStat:
+    """Row accounting for ONE source sheet (or one CSV file).
+
+    Invariant:  raw == top + header + empty + footer + kept
+    """
+    file: str = ""
+    sheet: str = ""
+    is_csv: bool = False
+    raw: int = 0      # every row that was read (including header and skipped rows)
+    top: int = 0      # rows skipped at the top
+    header: int = 0   # header row consumed
+    empty: int = 0    # completely empty rows removed
+    footer: int = 0   # rows skipped at the bottom
+    kept: int = 0     # rows that went on to the output
+
+
+@dataclass
+class Record:
+    """One table waiting to be merged (key None = CSV not yet assigned to a sheet)."""
+    key: Optional[str]
+    display: str
+    df: "pd.DataFrame"
+    file: str
+    stat: SheetStat
+    method: str = ""  # how a CSV was assigned to its sheet
+
+
+@dataclass
+class MergeResult:
+    output_file: Optional[Path] = None
+    report_file: Optional[Path] = None
+    human: bool = False
+    files_total: int = 0
+    files_ok: int = 0
+    sheets: int = 0
+    rows: int = 0  # rows in the output (standard: data rows only; human: all rows incl. headers)
+    cancelled: bool = False
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    stats: List[SheetStat] = field(default_factory=list)
+    out_sheets: List[Tuple[str, int]] = field(default_factory=list)
+    csv_assignments: List[Tuple[str, str, str]] = field(default_factory=list)
+
+    @property
+    def rows_read(self) -> int:
+        return sum(s.raw for s in self.stats)
+
+    @property
+    def removed_top(self) -> int:
+        return sum(s.top for s in self.stats)
+
+    @property
+    def removed_header(self) -> int:
+        return sum(s.header for s in self.stats)
+
+    @property
+    def removed_empty(self) -> int:
+        return sum(s.empty for s in self.stats)
+
+    @property
+    def removed_footer(self) -> int:
+        return sum(s.footer for s in self.stats)
+
+    @property
+    def rows_removed(self) -> int:
+        return self.removed_top + self.removed_header + self.removed_empty + self.removed_footer
+
+
+# =============================================================================
+# 3. SHARED HELPERS (files, ordering, CSV reading, sheet names)
+# =============================================================================
+def excel_engine(ext: str) -> str:
+    if ext in {".xlsx", ".xlsm"}:
+        return "openpyxl"
+    if ext == ".xlsb":
+        return "pyxlsb"
+    return "xlrd"
+
+
+def natural_key(text: str) -> list:
+    """Natural sort: file2 < file10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text.casefold())]
+
+
+def _read_text_any_encoding(path: Path) -> str:
+    for enc in CSV_ENCODINGS:
+        try:
+            with open(path, "r", encoding=enc, newline="") as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not detect the text encoding of {path.name}")
+
+
+def _sniff_delimiter(text: str) -> str:
+    sample = text[:50_000]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        lines = sample.splitlines()
+        first = lines[0] if lines else ""
+        return max(",;\t|", key=first.count) if first else ","
+
+
+def read_csv_raw(path: Path) -> "pd.DataFrame":
+    """Reads a CSV as a raw grid of text (no header handling at all).
+
+    Delimiter and encoding are auto-detected. Every row is kept (also empty ones),
+    so the row accounting is exact and `skip_top` means physical rows - exactly
+    like for Excel sheets. Only truly empty fields become NaN: values such as
+    "NA", "null" or "N/A" are real data and are preserved.
+    """
+    text = _read_text_any_encoding(path)
+    if not text.strip():
+        return pd.DataFrame()
+    delim = _sniff_delimiter(text)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delim)
+    ncols = max((len(r) for r in reader), default=0)
+    if ncols == 0:
+        return pd.DataFrame()
+    return pd.read_csv(
+        io.StringIO(text, newline=""),
+        sep=delim,
+        header=None,
+        names=list(range(ncols)),
+        dtype=str,
+        engine="python",
+        skip_blank_lines=False,
+        keep_default_na=False,
+        na_values=[""],
+    )
+
+
+def read_order_list(path: Path) -> List[str]:
+    """First column of the order file -> list of codes (as text)."""
+    ext = path.suffix.lower()
+    if ext in {".csv", ".txt"}:
+        text = _read_text_any_encoding(path)
+        codes = [re.split(r"[;\t,]", line)[0] for line in text.splitlines()]
+    else:
+        df = pd.read_excel(path, usecols=[0], header=None, dtype=str, engine=excel_engine(ext))
+        codes = df.iloc[:, 0].dropna().tolist()
+    cleaned = [str(c).strip().strip('"').strip() for c in codes]
+    return [c for c in cleaned if c]
+
+
+def sort_files(
+    files: List[Path], codes: List[str]
+) -> Tuple[List[Path], List[str], List[Path]]:
+    """Sorts files by the list of codes.
+
+    Matching is case-insensitive; when several codes match, the longest wins
+    (code "12" will not capture the file for code "123").
+    Returns: (sorted files, codes without a file, files without a code).
+    """
+    lowered = [(i, c.casefold()) for i, c in enumerate(codes)]
+    used_codes: set = set()
+    ordered: List[Tuple[int, list, Path]] = []
+    rest: List[Path] = []
+
+    for p in files:
+        name = p.name.casefold()
+        hits = [(i, c) for i, c in lowered if c in name]
+        if hits:
+            best_idx, _ = max(hits, key=lambda h: (len(h[1]), -h[0]))
+            used_codes.add(best_idx)
+            ordered.append((best_idx, natural_key(p.name), p))
+        else:
+            rest.append(p)
+
+    ordered.sort(key=lambda t: (t[0], t[1]))
+    rest.sort(key=lambda p: natural_key(p.name))
+    unmatched = [codes[i] for i, _ in lowered if i not in used_codes]
+    return [t[2] for t in ordered] + rest, unmatched, rest
+
+
+def unique_sheet_name(raw: str, used: Set[str]) -> str:
+    """One sheet name: no forbidden characters, max 31 chars, unique (case-insensitive)."""
+    base = _BAD_SHEET_CHARS.sub("_", raw).strip("'").strip()[:31] or "Sheet"
+    candidate, i = base, 2
+    while candidate.casefold() in used:
+        suffix = f"~{i}"
+        candidate = base[: 31 - len(suffix)] + suffix
+        i += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def make_safe_sheet_names(names: List[str]) -> List[str]:
+    used: Set[str] = set()
+    return [unique_sheet_name(n, used) for n in names]
+
+
+def sheet_key(name: str) -> str:
+    """Merge key of a sheet name: letters only, case-insensitive, digits ignored.
+
+    "Fund6789" and "Fund5678" -> "fund". A name with no letters at all (e.g. "2024")
+    falls back to its full text so that such sheets are not lumped together.
+    """
+    letters = "".join(ch for ch in name if ch.isalpha()).casefold()
+    return letters or name.strip().casefold()
+
+
+def sheet_display_name(name: str) -> str:
+    """Name of the merged output sheet: the source name without digits ("Fund6789" -> "Fund")."""
+    cleaned = re.sub(r"\d+", "", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-.\t")
+    return cleaned or name.strip()
+
+
+# ---- cleaning (standard engine) ----------------------------------------------------
+def read_workbook(path: Path) -> List[Tuple[Optional[str], "pd.DataFrame"]]:
+    """Reads ALL sheets of a file as RAW grids (header=None).
+
+    Returns [(sheet_name, raw_frame)]; for CSV files sheet_name is None.
+    """
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        return [(None, read_csv_raw(path))]
+
+    result: List[Tuple[Optional[str], pd.DataFrame]] = []
+    with pd.ExcelFile(path, engine=excel_engine(ext)) as xls:
+        for name in xls.sheet_names:
+            result.append((str(name), xls.parse(name, header=None)))
+    return result
+
+
+def dedupe_columns(cols: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+
+def header_text(value, idx: int) -> str:
+    """Header cell -> clean column name (extra spaces/newlines removed)."""
+    try:
+        if pd.isna(value):
+            return f"Unnamed: {idx}"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return re.sub(r"\s+", " ", str(value)).strip() or f"Unnamed: {idx}"
+
+
+def numeric_where_possible(df: "pd.DataFrame") -> "pd.DataFrame":
+    """CSV is read as text; turn columns that are fully numeric into numbers so they
+    stack nicely with numeric Excel columns.
+
+    Safe by design: a column is converted only if EVERY value is a plain number.
+    Codes with leading zeros ("00123") and very long IDs (> 15 digits) stay text,
+    otherwise they would be silently corrupted.
+    """
+    if df.shape[1] == 0:
+        return df
+    cols = {}
+    for i, name in enumerate(df.columns):
+        series = df.iloc[:, i]
+        values = series.dropna().astype(str)
+        if len(values) and values.str.fullmatch(_PLAIN_NUMBER.pattern).all() and (
+            values.str.replace(r"[-.]", "", regex=True).str.len() <= 15
+        ).all():
+            series = pd.to_numeric(series)
+        cols[name] = series
+    return pd.DataFrame(cols, index=df.index)
+
+
+def process_raw(
+    raw: "pd.DataFrame", skip_top: int, skip_bottom: int, from_csv: bool
+) -> Tuple["pd.DataFrame", SheetStat]:
+    """Raw grid -> (clean frame with a header, row statistics).
+
+    Steps: skip top rows -> first non-empty row is the header -> drop empty rows
+    -> drop footer rows. Every removed row is counted in the statistics.
+    """
+    st = SheetStat(raw=len(raw), is_csv=from_csv)
+    nothing = pd.DataFrame()
+
+    st.top = min(skip_top, len(raw))
+    rest = raw.iloc[st.top:]
+    if rest.empty:
+        return nothing, st
+
+    blank = rest.isna().all(axis=1).to_numpy()
+    filled_pos = (~blank).nonzero()[0]
+    if len(filled_pos) == 0:  # nothing but empty rows
+        st.empty = len(rest)
+        return nothing, st
+
+    h = int(filled_pos[0])  # empty rows above the header
+    st.empty = h
+    st.header = 1
+    header_vals = rest.iloc[h].tolist()
+
+    body = rest.iloc[h + 1:]
+    body_filled = body.dropna(how="all")
+    st.empty += len(body) - len(body_filled)
+    body = body_filled
+
+    # drop columns without a header that contain no data at all
+    keep = [
+        i for i, v in enumerate(header_vals)
+        if not (pd.isna(v) and body.iloc[:, i].isna().all())
+    ]
+    names = dedupe_columns([header_text(header_vals[i], i) for i in keep])
+    body = body.iloc[:, keep].copy()
+    body.columns = names
+
+    # footer is counted after empty rows have been removed
+    cut = min(skip_bottom, len(body)) if skip_bottom > 0 else 0
+    if cut:
+        body = body.iloc[:-cut]
+        st.footer = cut
+
+    body = numeric_where_possible(body) if from_csv else body.infer_objects()
+    body = body.reset_index(drop=True)
+    st.kept = len(body)
+    return body, st
+
+
+def sanitize_for_excel(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Removes control characters that make openpyxl raise IllegalCharacterError."""
+    obj_cols = [c for c in df.columns if df[c].dtype.kind == "O"]
+    if not obj_cols:
+        return df
+    df = df.copy()
+    for c in obj_cols:
+        df[c] = df[c].map(lambda v: _ILLEGAL_XML.sub("", v) if isinstance(v, str) else v)
+    return df
+
+
+def _cell_len(value) -> int:
+    """Display length of a cell; empty cells (NaN/None/NA) count as 0."""
+    try:
+        if pd.isna(value):
+            return 0
+    except (TypeError, ValueError):
+        pass
+    return len(str(value))
+
+
+def format_sheet(ws, df: "pd.DataFrame") -> None:
+    """Styled header, frozen first row, autofilter, column widths."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    if df.shape[1] == 0:
+        return
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    font = Font(bold=True, color="FFFFFF")
+    fill = PatternFill("solid", fgColor="1F3864")
+    align = Alignment(vertical="center", wrap_text=False)
+    for idx, col in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=idx)
+        cell.font, cell.fill, cell.alignment = font, fill, align
+        longest = max([len(str(col))] + [_cell_len(v) for v in df[col].head(500)])
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(10, longest + 2), 50)
+
+
+# ---- CSV -> sheet assignment ---------------------------------------------------------
+def column_set(df: "pd.DataFrame") -> Set[str]:
+    """Normalised column names used for comparing tables."""
+    return {str(c).casefold() for c in df.columns if c != SOURCE_COL}
+
+
+def match_by_file_name(stem: str, known: Dict[str, str]) -> Optional[str]:
+    """Sheet key whose name appears in the file name (longest wins).
+
+    Digits are ignored, only neighbouring LETTERS block a match:
+    "Report_Fund_2024" and "Fund123" match sheet "Fund", but "Fundamentals" does not.
+    Words of the sheet name may be separated by any spaces / punctuation / digits.
+    """
+    text = stem.casefold()
+    best: Optional[str] = None
+    for key, display in known.items():
+        if not key:
+            continue
+        words = re.findall(r"[^\W\d_]+", display.casefold())
+        if words:
+            core = r"[\W\d_]*".join(re.escape(w) for w in words)
+            pattern = r"(?<![^\W\d_])" + core + r"(?![^\W\d_])"
+        else:  # sheet name without letters: exact whole-token match
+            pattern = r"(?<![^\W_])" + re.escape(key) + r"(?![^\W_])"
+        if re.search(pattern, text) and (best is None or len(key) > len(best)):
+            best = key
+    return best
+
+
+def match_by_headers(cols: Set[str], sheet_cols: Dict[str, Set[str]]) -> Optional[str]:
+    """Sheet key whose columns overlap with `cols` the most (>= threshold)."""
+    best_key: Optional[str] = None
+    best_score = 0.0
+    for key, other in sheet_cols.items():
+        union = len(cols | other)
+        score = len(cols & other) / union if union else 0.0
+        if score > best_score:
+            best_key, best_score = key, score
+    return best_key if best_score >= HEADER_MATCH_THRESHOLD else None
+
+
+def group_sheet_name(stems: List[str]) -> str:
+    """Name for a NEW sheet built from CSV file names (common part, no dates/numbers)."""
+    base = os.path.commonprefix(stems) if len(stems) > 1 else stems[0]
+    base = re.sub(r"[\W_]*\d[\d\W_]*$", "", base)  # trailing numbers / dates
+    base = re.sub(r"[\W_\d]+$", "", base)          # trailing separators left over
+    base = re.sub(r"^[\W_]+", "", base).strip()
+    return base or DEFAULT_CSV_SHEET
+
+
+def assign_csv_records(records: List[Record], res: MergeResult) -> None:
+    """Gives every CSV record a sheet key/name (see the module docstring)."""
+    known: Dict[str, str] = {}            # sheet key -> display name
+    sheet_cols: Dict[str, Set[str]] = {}  # sheet key -> union of its columns
+    for r in records:
+        if r.key is not None:
+            known.setdefault(r.key, r.display)
+            sheet_cols.setdefault(r.key, set()).update(column_set(r.df))
+
+    pending: Dict[frozenset, List[Record]] = {}
+    for r in records:
+        if r.key is not None:
+            continue
+        key = match_by_file_name(Path(r.file).stem, known)
+        method = "file name"
+        if key is None:
+            key = match_by_headers(column_set(r.df), sheet_cols)
+            method = "matching columns"
+        if key is not None:
+            r.key, r.display, r.method = key, known[key], method
+        else:
+            pending.setdefault(frozenset(column_set(r.df)), []).append(r)
+
+    for group in pending.values():
+        name = group_sheet_name([Path(r.file).stem for r in group])
+        key = sheet_key(name)
+        known.setdefault(key, name)
+        for r in group:
+            r.key, r.display, r.method = key, known[key], "new sheet"
+        files = ", ".join(r.file for r in group[:3]) + (" …" if len(group) > 3 else "")
+        res.warnings.append(
+            f"CSV without a matching Excel sheet ({files}) was put into the new sheet "
+            f"'{known[key]}'. Include the sheet name in the CSV file name to control this."
+        )
+
+    for r in records:
+        if r.stat.is_csv:
+            r.stat.sheet = f"{r.display} (CSV)"
+    res.csv_assignments = [
+        (r.file, r.display, r.method) for r in records if r.stat.is_csv and r.method
+    ]
+
+
+# =============================================================================
+# 4. ENGINE A - STANDARD (pandas + openpyxl)
+# =============================================================================
+def _merge_standard(
+    opts: MergeOptions,
+    files: List[Path],
+    res: MergeResult,
+    report: ProgressCb,
+    cancel: Optional[threading.Event],
+    tmp_file: Path,
+) -> None:
+    """Reads, cleans and merges the data; writes the workbook to `tmp_file`."""
+    total_steps = len(files) + 1
+    records: List[Record] = []
+
+    for n, path in enumerate(files):
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            return
+        report(n, total_steps, f"Loading {n + 1}/{len(files)}: {path.name}")
+        try:
+            local_records: List[Record] = []
+            local_stats: List[SheetStat] = []
+            for sheet_name, raw in read_workbook(path):
+                is_csv = sheet_name is None
+                df, st = process_raw(raw, opts.skip_top, opts.skip_bottom, from_csv=is_csv)
+                st.file = path.name
+                st.sheet = "" if is_csv else sheet_name.strip()
+                local_stats.append(st)
+                if df.empty:
+                    continue
+                if opts.add_source_column and SOURCE_COL not in df.columns:
+                    df.insert(0, SOURCE_COL, path.name)
+                if is_csv:
+                    local_records.append(Record(None, "", df, path.name, st))
+                else:
+                    name = sheet_name.strip()
+                    local_records.append(
+                        Record(sheet_key(name), sheet_display_name(name), df, path.name, st))
+
+            # commit only when the whole file was read without errors
+            res.stats.extend(local_stats)
+            records.extend(local_records)
+            res.files_ok += 1
+            if not local_records:
+                res.warnings.append(f"{path.name}: no data left after applying row filters")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error in file %s:\n%s", path.name, traceback.format_exc())
+            res.errors.append(f"{path.name}: {describe_exception(exc)}")
+
+    if not records:
+        detail = f" First error: {res.errors[0]}" if res.errors else ""
+        raise ValueError("No tabular data left to merge." + detail)
+
+    assign_csv_records(records, res)
+
+    # sheet key (casefold) -> (display name, list of frames), in file order
+    sheets: Dict[str, Tuple[str, List[pd.DataFrame]]] = {}
+    for r in records:
+        sheets.setdefault(r.key, (r.display, []))[1].append(r.df)
+
+    parts: List[Tuple[str, pd.DataFrame]] = []
+    for display, frames in sheets.values():
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        if len(merged) > EXCEL_MAX_DATA_ROWS:
+            for k, start in enumerate(range(0, len(merged), EXCEL_MAX_DATA_ROWS), start=1):
+                parts.append((f"{display} ({k})", merged.iloc[start: start + EXCEL_MAX_DATA_ROWS]))
+            res.warnings.append(
+                f"Sheet '{display}' exceeds the Excel row limit - split into parts."
+            )
+        else:
+            parts.append((display, merged))
+
+    safe_names = make_safe_sheet_names([name for name, _ in parts])
+
+    report(len(files), total_steps, "Saving output file…")
+    with pd.ExcelWriter(tmp_file, engine="openpyxl") as writer:
+        for (_, df), name in zip(parts, safe_names):
+            df = sanitize_for_excel(df)
+            df.to_excel(writer, sheet_name=name, index=False)
+            try:
+                format_sheet(writer.sheets[name], df)
+            except Exception:  # noqa: BLE001  (cosmetic only - never block saving)
+                log.warning("Formatting skipped for '%s':\n%s", name, traceback.format_exc())
+                res.warnings.append(f"Formatting skipped for sheet '{name}'")
+
+    res.sheets = len(parts)
+    res.rows = sum(len(df) for _, df in parts)
+    res.out_sheets = [(name, len(df)) for (_, df), name in zip(parts, safe_names)]
+
+
+# =============================================================================
+# 5. ENGINE B - "MERGE LIKE HUMAN" (Microsoft Excel through COM)
+# =============================================================================
+def _ensure_process_gone(pid: int, timeout_ms: int = 5000) -> None:
+    """Last-resort cleanup: terminate our private Excel process if it did not exit."""
+    if not pid or os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        SYNCHRONIZE, PROCESS_TERMINATE = 0x00100000, 0x0001
+        handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return  # already gone
+        try:
+            if kernel32.WaitForSingleObject(handle, timeout_ms) != 0:  # not WAIT_OBJECT_0
+                log.warning("Excel process %s did not exit - terminating it.", pid)
+                kernel32.TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        log.warning("Process cleanup failed:\n%s", traceback.format_exc())
+
+
+class ExcelSession:
+    """A private, invisible Excel instance driven through COM.
+
+    * DispatchEx always starts a NEW Excel process, so a workbook the user has
+      open in their own Excel is never touched (and never closed by Quit()).
+    * Macros are disabled, alerts and events are off, files are opened read-only.
+    * close() quits Excel and, if the process survives, terminates it.
+    """
+
+    def __init__(self) -> None:
+        self.excel: Any = None
+        self.wb: Any = None
+        self._pid = 0
+        self._com_ready = False
+        self._pythoncom: Any = None
+        self._initial_sheets: List[Any] = []
+        self._used_names: Set[str] = set()
+
+    # -- lifecycle -------------------------------------------------------------
+    def __enter__(self) -> "ExcelSession":
+        try:
+            self._start()
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.close()
+        return False
+
+    def _start(self) -> None:
+        try:
+            import pythoncom
+            import win32com.client as win32
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'pywin32' package is required for 'Merge like human' "
+                "(install it with: pip install pywin32)."
+            ) from exc
+
+        self._pythoncom = pythoncom
+        pythoncom.CoInitialize()  # COM must be initialised in the thread that uses it
+        self._com_ready = True
+        try:
+            self.excel = win32.DispatchEx("Excel.Application")
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Microsoft Excel could not be started. 'Merge like human' requires "
+                "an installed desktop version of Excel."
+            ) from exc
+
+        try:
+            pid = ctypes.c_ulong(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(int(self.excel.Hwnd), ctypes.byref(pid))
+            self._pid = int(pid.value)
+        except Exception:  # noqa: BLE001
+            self._pid = 0
+
+        for attr, value in (
+            ("Visible", False),
+            ("DisplayAlerts", False),
+            ("ScreenUpdating", False),
+            ("EnableEvents", False),
+            ("AutomationSecurity", MSO_AUTOMATION_SECURITY_FORCE_DISABLE),
+        ):
+            try:
+                setattr(self.excel, attr, value)
+            except Exception:  # noqa: BLE001
+                log.info("Excel setting %s could not be applied.", attr)
+
+        self.wb = self.excel.Workbooks.Add()
+        try:
+            self.excel.Calculation = XL_CALC_MANUAL  # much faster while pasting
+        except Exception:  # noqa: BLE001
+            pass
+        # remember the default sheets of the new workbook - removed before saving
+        self._initial_sheets = [
+            self.wb.Worksheets(i) for i in range(1, self.wb.Worksheets.Count + 1)
+        ]
+
+    def close(self) -> None:
+        wb, excel, pid = self.wb, self.excel, self._pid
+        self.wb = None
+        self.excel = None
+        self._initial_sheets = []
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:  # noqa: BLE001
+                pass
+        if excel is not None:
+            try:
+                excel.CutCopyMode = False
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                excel.Quit()
+            except Exception:  # noqa: BLE001
+                pass
+        wb = excel = None  # release COM references before the process check
+        gc.collect()
+        _ensure_process_gone(pid)
+        self._pid = 0
+        if self._com_ready and self._pythoncom is not None:
+            try:
+                self._pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+            self._com_ready = False
+
+    # -- reading ---------------------------------------------------------------
+    def open_book(self, path: Path) -> Any:
+        """Opens a source file read-only. An empty password turns a password prompt
+        (which would hang an invisible Excel) into a normal error."""
+        return self.excel.Workbooks.Open(
+            str(path.resolve()),
+            UpdateLinks=0,
+            ReadOnly=True,
+            IgnoreReadOnlyRecommended=True,
+            Password="",
+            WriteResPassword="",
+        )
+
+    def extent(self, ws: Any) -> Optional[Tuple[int, int]]:
+        """(last_row, last_col) measured from A1, or None for a sheet without values."""
+        used = ws.UsedRange
+        try:
+            if self.excel.WorksheetFunction.CountA(used) == 0:
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        return (
+            int(used.Row + used.Rows.Count - 1),
+            int(used.Column + used.Columns.Count - 1),
+        )
+
+    @staticmethod
+    def show_all_rows(ws: Any) -> None:
+        """A filtered sheet would copy visible rows only - reveal everything (in memory)."""
+        try:
+            if ws.FilterMode:
+                ws.ShowAllData()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def header_names(ws: Any, last_row: int, last_col: int) -> List[str]:
+        """Column names of the first non-empty row (used to match CSV files to sheets)."""
+        rows_n, cols_n = min(last_row, 30), min(last_col, 256)
+        value = ws.Range(ws.Cells(1, 1), ws.Cells(rows_n, cols_n)).Value
+        rows = [value] if not isinstance(value, tuple) else value
+        for row in rows:
+            cells = row if isinstance(row, tuple) else (row,)
+            if any(v is not None and str(v).strip() for v in cells):
+                return [header_text(v, i) for i, v in enumerate(cells) if v is not None]
+        return []
+
+    # -- writing ---------------------------------------------------------------
+    def add_sheet(self, display: str) -> Tuple[Any, str]:
+        count = self.wb.Worksheets.Count
+        ws = self.wb.Worksheets.Add(After=self.wb.Worksheets(count))
+        name = unique_sheet_name(display, self._used_names)
+        try:
+            ws.Name = name
+        except Exception:  # noqa: BLE001 (e.g. reserved name)
+            name = unique_sheet_name(f"Sheet{count + 1}", self._used_names)
+            ws.Name = name
+        return ws, name
+
+    def copy_block(
+        self, src_ws: Any, last_row: int, last_col: int, dest_ws: Any, dest_row: int,
+        with_widths: bool,
+    ) -> None:
+        """Ctrl+A / Ctrl+C / Ctrl+V of a sheet: everything from A1 to the last used cell.
+
+        Range.Copy(Destination) pastes values, formulas and all formatting and does
+        not depend on (or overwrite) the Windows clipboard.
+        """
+        src_rng = src_ws.Range(src_ws.Cells(1, 1), src_ws.Cells(last_row, last_col))
+        src_rng.Copy(dest_ws.Cells(dest_row, 1))
+        try:
+            self.excel.CutCopyMode = False
+        except Exception:  # noqa: BLE001
+            pass
+        if with_widths:
+            for c in range(1, min(last_col, MAX_WIDTH_COLUMNS) + 1):
+                try:
+                    dest_ws.Columns(c).ColumnWidth = src_ws.Columns(c).ColumnWidth
+                except Exception:  # noqa: BLE001
+                    break
+
+    def finalize_and_save(self, path: Path) -> None:
+        for ws in self._initial_sheets:
+            try:
+                ws.Delete()
+            except Exception:  # noqa: BLE001
+                log.info("Default sheet could not be deleted.")
+        self._initial_sheets = []
+        try:
+            self.excel.Calculation = XL_CALC_AUTOMATIC
+        except Exception:  # noqa: BLE001
+            pass
+        for i in range(self.wb.Worksheets.Count, 0, -1):  # ends with the first sheet active
+            try:
+                ws = self.wb.Worksheets(i)
+                ws.Activate()
+                ws.Range("A1").Select()
+            except Exception:  # noqa: BLE001
+                pass
+        self.wb.SaveAs(str(path.resolve()), FileFormat=XL_OPEN_XML_WORKBOOK)
+        self.wb.Close(SaveChanges=False)
+        self.wb = None
+
+
+@dataclass
+class TargetPart:
+    ws: Any
+    name: str
+    rows: int = 0  # rows already written; the next free row is rows + 1
+
+
+@dataclass
+class TargetSheet:
+    display: str
+    parts: List[TargetPart] = field(default_factory=list)
+
+
+_CSV_NUMBER_DIGITS = 15
+
+
+def csv_cell(value) -> Any:
+    """Typed value of a CSV cell for the scratch workbook (numbers stay numbers,
+    codes with leading zeros and very long IDs stay text)."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value)
+    if _PLAIN_NUMBER.fullmatch(text) and len(text.replace("-", "").replace(".", "")) <= _CSV_NUMBER_DIGITS:
+        return float(text) if "." in text else int(text)
+    return _ILLEGAL_XML.sub("", text)[:32767]
+
+
+def csv_header_names(raw: "pd.DataFrame") -> List[str]:
+    for row in raw.itertuples(index=False, name=None):
+        if any(not pd.isna(v) for v in row):
+            return [header_text(v, i) for i, v in enumerate(row) if not pd.isna(v)]
+    return []
+
+
+def write_csv_workbook(raw: "pd.DataFrame", path: Path) -> None:
+    """Scratch .xlsx with the CSV grid, so Excel can copy it like any other sheet
+    (no locale-dependent parsing of the CSV text by Excel)."""
+    values = [[csv_cell(v) for v in row] for row in raw.itertuples(index=False, name=None)]
+    pd.DataFrame(values, dtype=object).to_excel(path, header=False, index=False, engine="openpyxl")
+
+
+def _human_copy_all(
+    xl: ExcelSession,
+    xl_files: List[Path],
+    csv_files: List[Path],
+    scratch: Path,
+    res: MergeResult,
+    report: ProgressCb,
+    cancel: Optional[threading.Event],
+    total_steps: int,
+) -> List[Tuple[str, int]]:
+    """Copies every sheet into the output workbook. Returns [(sheet name, rows)].
+
+    All COM objects created here are local to this function, so they are released
+    before the Excel session is closed.
+    """
+    targets: Dict[str, TargetSheet] = {}
+    records: List[Record] = []  # header-only tables, used to match CSV files to sheets
+    n_files = len(xl_files) + len(csv_files)
+
+    def place(key: str, display: str, src_ws: Any, last_row: int, last_col: int) -> None:
+        target = targets.setdefault(key, TargetSheet(display))
+        part = target.parts[-1] if target.parts else None
+        created = False
+        if part is None or part.rows + last_row > EXCEL_MAX_ROWS:
+            if part is not None:
+                msg = f"Sheet '{display}' exceeds the Excel row limit - continued in a new sheet."
+                if msg not in res.warnings:
+                    res.warnings.append(msg)
+            label = display if not target.parts else f"{display} ({len(target.parts) + 1})"
+            ws, name = xl.add_sheet(label)
+            part = TargetPart(ws, name)
+            target.parts.append(part)
+            created = True
+        xl.copy_block(src_ws, last_row, last_col, part.ws, part.rows + 1, created)
+        part.rows += last_row
+
+    # ---- pass 1: Excel files (in the chosen order) ----
+    for k, path in enumerate(xl_files):
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            return []
+        report(k, total_steps, f"Copying {k + 1}/{n_files}: {path.name}")
+        book = None
+        copied = 0
+        try:
+            book = xl.open_book(path)
+            for i in range(1, book.Worksheets.Count + 1):
+                ws = book.Worksheets(i)
+                name = str(ws.Name).strip()
+                extent = xl.extent(ws)
+                if extent is None:
+                    res.stats.append(SheetStat(file=path.name, sheet=name))
+                    continue
+                last_row, last_col = extent
+                xl.show_all_rows(ws)
+                headers = xl.header_names(ws, last_row, last_col)
+                st = SheetStat(file=path.name, sheet=name, raw=last_row, kept=last_row)
+                key, display = sheet_key(name), sheet_display_name(name)
+                place(key, display, ws, last_row, last_col)
+                res.stats.append(st)
+                records.append(Record(key, display, pd.DataFrame(columns=headers), path.name, st))
+                copied += 1
+            res.files_ok += 1
+            if copied == 0:
+                res.warnings.append(f"{path.name}: no data found")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error in file %s:\n%s", path.name, traceback.format_exc())
+            note = f" (partially copied: {copied} sheet(s))" if copied else ""
+            res.errors.append(f"{path.name}: {describe_exception(exc)}{note}")
+        finally:
+            if book is not None:
+                try:
+                    book.Close(SaveChanges=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            ws = book = None
+
+    # ---- pass 2a: CSV files -> scratch workbooks + header info ----
+    csv_jobs: List[Tuple[Record, Path]] = []
+    for j, path in enumerate(csv_files):
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            return []
+        report(len(xl_files) + j, total_steps, f"Reading CSV {len(xl_files) + j + 1}/{n_files}: {path.name}")
+        try:
+            raw = read_csv_raw(path)
+            st = SheetStat(file=path.name, is_csv=True, raw=len(raw), kept=len(raw))
+            if raw.empty:
+                res.stats.append(SheetStat(file=path.name, is_csv=True))
+                res.files_ok += 1
+                res.warnings.append(f"{path.name}: file is empty")
+                continue
+            scratch_file = scratch / f"csv_{len(csv_jobs)}.xlsx"
+            write_csv_workbook(raw, scratch_file)
+            rec = Record(None, "", pd.DataFrame(columns=csv_header_names(raw)), path.name, st)
+            records.append(rec)
+            csv_jobs.append((rec, scratch_file))
+            res.stats.append(st)
+            res.files_ok += 1
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error in file %s:\n%s", path.name, traceback.format_exc())
+            res.errors.append(f"{path.name}: {describe_exception(exc)}")
+
+    if csv_jobs:
+        assign_csv_records(records, res)
+
+    # ---- pass 2b: CSV data -> sheets ----
+    for rec, scratch_file in csv_jobs:
+        if cancel is not None and cancel.is_set():
+            res.cancelled = True
+            return []
+        book = None
+        try:
+            book = xl.open_book(scratch_file)
+            ws = book.Worksheets(1)
+            extent = xl.extent(ws)
+            if extent is None:  # only blank cells
+                rec.stat.empty, rec.stat.kept = rec.stat.raw, 0
+                continue
+            last_row, last_col = extent
+            rec.stat.kept = last_row
+            rec.stat.empty = rec.stat.raw - last_row  # trailing blank rows
+            place(rec.key or rec.display.casefold(), rec.display, ws, last_row, last_col)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error in file %s:\n%s", rec.file, traceback.format_exc())
+            res.errors.append(f"{rec.file}: {describe_exception(exc)}")
+            if rec.stat in res.stats:  # nothing reached the output - keep the books balanced
+                res.stats.remove(rec.stat)
+                res.files_ok -= 1
+        finally:
+            if book is not None:
+                try:
+                    book.Close(SaveChanges=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            ws = book = None
+
+    out_sheets = [(p.name, p.rows) for t in targets.values() for p in t.parts]
+    targets.clear()
+    return out_sheets
+
+
+def _merge_human(
+    opts: MergeOptions,
+    files: List[Path],
+    res: MergeResult,
+    report: ProgressCb,
+    cancel: Optional[threading.Event],
+    tmp_file: Path,
+) -> None:
+    """Merge like a human; the workbook is saved to `tmp_file`."""
+    xl_files = [p for p in files if p.suffix.lower() != ".csv"]
+    csv_files = [p for p in files if p.suffix.lower() == ".csv"]
+    total_steps = len(files) + 1
+    scratch = Path(tempfile.mkdtemp(prefix="xlmerge_"))
+    try:
+        with ExcelSession() as xl:
+            out_sheets = _human_copy_all(
+                xl, xl_files, csv_files, scratch, res, report, cancel, total_steps
+            )
+            if res.cancelled:
+                return
+            if not out_sheets:
+                detail = f" First error: {res.errors[0]}" if res.errors else ""
+                raise ValueError("No data could be copied from the input files." + detail)
+            report(len(files), total_steps, "Saving output file (Excel)…")
+            xl.finalize_and_save(tmp_file)
+        res.sheets = len(out_sheets)
+        res.rows = sum(rows for _, rows in out_sheets)
+        res.out_sheets = out_sheets
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+# =============================================================================
+# 6. REPORT
+# =============================================================================
+def build_report(res: MergeResult, opts: MergeOptions, generated: datetime) -> str:
+    """Plain-text report with the row accounting (input -> removed -> output)."""
+    bar = "=" * 78
+    thin = "-" * 78
+    out_name = res.output_file.name if res.output_file else "-"
+    n = lambda v: f"{v:,}"  # noqa: E731
+    mode = "Merge like human (Excel copy / paste)" if res.human else "Standard (pandas / openpyxl)"
+
+    L: List[str] = [
+        bar,
+        f"{APP_NAME} v{APP_VERSION} - MERGE REPORT",
+        bar,
+        f"Generated      : {generated:%Y-%m-%d %H:%M:%S}",
+        f"Mode           : {mode}",
+        f"Input folder   : {opts.input_dir}",
+        f"Output folder  : {opts.output_dir}",
+        f"Output file    : {out_name}",
+        f"Order file     : {opts.order_file if opts.order_file else '-'}",
+        "",
+    ]
+    if not res.human:
+        L += [
+            "Settings",
+            f"  Skip rows at top      : {opts.skip_top}",
+            f"  Skip rows at bottom   : {opts.skip_bottom}",
+            f"  Source file column    : {'yes' if opts.add_source_column else 'no'}",
+            "",
+        ]
+    L += [
+        f"Files processed OK : {res.files_ok} / {res.files_total}",
+        f"Sheets in output   : {res.sheets}",
+        "",
+        thin,
+        "ROW SUMMARY",
+        thin,
+        f"Rows read from input files (all rows, incl. headers) : {n(res.rows_read):>14}",
+        "",
+    ]
+    if res.human:
+        L += [
+            f"Rows removed                                         : {n(res.rows_removed):>14}",
+            "   (nothing is removed in 'Merge like human' mode, except trailing blank CSV rows)",
+            "",
+            f"Rows in the output file (headers included)           : {n(res.rows):>14}",
+            "",
+        ]
+    else:
+        L += [
+            f"Rows removed (total)                                 : {n(res.rows_removed):>14}",
+            f"   - skipped at the top                              : {n(res.removed_top):>14}",
+            f"   - header rows (one per source sheet)              : {n(res.removed_header):>14}",
+            f"   - empty rows                                      : {n(res.removed_empty):>14}",
+            f"   - skipped at the bottom (footer)                  : {n(res.removed_footer):>14}",
+            "",
+            f"Data rows in the output file                         : {n(res.rows):>14}",
+            f"Header rows in the output file (1 per sheet)         : {n(res.sheets):>14}",
+            f"Rows in the output file incl. headers                : {n(res.rows + res.sheets):>14}",
+            "",
+        ]
+    balanced = res.rows_read == res.rows_removed + res.rows
+    L.append(
+        "Check: read = removed + output rows  ->  "
+        + ("OK" if balanced else "MISMATCH (see log)")
+    )
+
+    L += ["", thin, "OUTPUT SHEETS (rows)", thin]
+    if res.out_sheets:
+        w = max(len(name) for name, _ in res.out_sheets)
+        for name, count in res.out_sheets:
+            L.append(f"  {name.ljust(w)}  {n(count):>12}")
+    else:
+        L.append("  (none)")
+
+    groups: Dict[str, List[str]] = {}
+    for s in res.stats:
+        if s.is_csv or not s.sheet:
+            continue
+        names = groups.setdefault(sheet_key(s.sheet), [])
+        if s.sheet.casefold() not in (x.casefold() for x in names):
+            names.append(s.sheet)
+    merged_groups = [v for v in groups.values() if len(v) > 1]
+    if merged_groups:
+        L += ["", thin, "SHEET NAMES MERGED TOGETHER (letters match, digits differ)", thin]
+        for names in merged_groups:
+            L.append(f"  {sheet_display_name(names[0])}  <-  " + ", ".join(names))
+
+    if res.csv_assignments:
+        L += ["", thin, "CSV FILES -> SHEETS", thin]
+        fw = min(max(len(a) for a, _, _ in res.csv_assignments), 45)
+        sw = min(max(len(b) for _, b, _ in res.csv_assignments), 31)
+        for file, sheet, how in res.csv_assignments:
+            f = file if len(file) <= fw else file[: fw - 1] + "…"
+            s = sheet if len(sheet) <= sw else sheet[: sw - 1] + "…"
+            L.append(f"  {f.ljust(fw)}  ->  {s.ljust(sw)}  (by {how})")
+
+    L += ["", thin, "PER SOURCE SHEET", thin]
+    if res.stats:
+        rows = [
+            (s.file, s.sheet or "-", s.raw, s.top, s.header, s.empty, s.footer, s.kept)
+            for s in res.stats
+        ]
+        fw = min(max(len("File"), *(len(r[0]) for r in rows)), 45)
+        sw = min(max(len("Sheet"), *(len(r[1]) for r in rows)), 31)
+        line = "-" * (fw + sw + 4 + 9 * 6 + 2 * 5)
+
+        def fmt(a, b, *nums) -> str:
+            a = a if len(a) <= fw else a[: fw - 1] + "…"
+            b = b if len(b) <= sw else b[: sw - 1] + "…"
+            return f"{a.ljust(fw)}  {b.ljust(sw)}  " + "  ".join(f"{x:>9}" for x in nums)
+
+        L.append(fmt("File", "Sheet", "Read", "Top", "Header", "Empty", "Footer", "Kept"))
+        L.append(line)
+        for r in rows:
+            L.append(fmt(r[0], r[1], *(n(x) for x in r[2:])))
+        L.append(line)
+        L.append(
+            fmt("TOTAL", "", n(res.rows_read), n(res.removed_top), n(res.removed_header),
+                n(res.removed_empty), n(res.removed_footer), n(sum(s.kept for s in res.stats)))
+        )
+    else:
+        L.append("  (no data was read)")
+
+    if res.errors:
+        L += ["", thin, f"ERRORS ({len(res.errors)}) - rows of failed files are NOT counted above", thin]
+        L += [f"  * {e}" for e in res.errors]
+    if res.warnings:
+        L += ["", thin, f"WARNINGS ({len(res.warnings)})", thin]
+        L += [f"  * {w}" for w in res.warnings]
+
+    L.append("")
+    return "\n".join(L)
+
+
+# =============================================================================
+# 7. DISPATCHER
+# =============================================================================
+def merge_folder(
+    opts: MergeOptions,
+    progress: Optional[ProgressCb] = None,
+    cancel: Optional[threading.Event] = None,
+) -> MergeResult:
+    """Main routine: list files, order them, run the selected engine, save, report.
+
+    Raises ValueError / RuntimeError with a user-readable message on user errors.
+    """
+    report: ProgressCb = progress or (lambda done, total, msg: None)
+    res = MergeResult(human=opts.merge_like_human)
+
+    if not opts.input_dir.is_dir():
+        raise ValueError("The input folder does not exist.")
+    if not opts.output_dir.is_dir():
+        raise ValueError("The output folder does not exist.")
+    if opts.merge_like_human and os.name != "nt":
+        raise ValueError("'Merge like human' works only on Windows with Microsoft Excel installed.")
+
+    # --- input files (skip Excel temp files and our own previous outputs) ---
+    files = [
+        p
+        for p in opts.input_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_EXTS
+        and not p.name.startswith(("~$", OUTPUT_PREFIX))
+    ]
+    if not files:
+        raise ValueError("No Excel/CSV files found in the input folder.")
+
+    # --- ordering ---
+    codes: List[str] = []
+    if opts.order_file:
+        try:
+            codes = read_order_list(opts.order_file)
+            log.info("Order list loaded: %d entries", len(codes))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Order file: %s", exc)
+            res.warnings.append(f"Could not load the order file: {exc}")
+
+    if codes:
+        files, unmatched, unordered = sort_files(files, codes)
+        if unmatched:
+            res.warnings.append(
+                f"Codes from the order file without a matching file ({len(unmatched)}): "
+                + ", ".join(unmatched[:10])
+                + (" …" if len(unmatched) > 10 else "")
+            )
+        if unordered:
+            res.warnings.append(
+                f"Files not in the order list (appended at the end): {len(unordered)}"
+            )
+    else:
+        files.sort(key=lambda p: natural_key(p.name))
+
+    res.files_total = len(files)
+
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    tag = "human_" if opts.merge_like_human else ""
+    output_file = opts.output_dir / f"{OUTPUT_PREFIX}{tag}{stamp}.xlsx"
+    report_file = opts.output_dir / f"{REPORT_PREFIX}{tag}{stamp}.txt"
+    tmp_file = output_file.with_name(output_file.stem + ".tmp.xlsx")
+
+    engine = _merge_human if opts.merge_like_human else _merge_standard
+    try:
+        engine(opts, files, res, report, cancel, tmp_file)
+        if res.cancelled:
+            return res
+        os.replace(tmp_file, output_file)  # atomic: no half-written output
+    finally:
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    res.output_file = output_file
+
+    if res.rows_read != res.rows_removed + res.rows:
+        log.error(
+            "Row accounting mismatch: read=%d removed=%d output=%d",
+            res.rows_read, res.rows_removed, res.rows,
+        )
+
+    # --- TXT report (never blocks the merge itself) ---
+    try:
+        report_file.write_text(build_report(res, opts, now), encoding="utf-8-sig")
+        res.report_file = report_file
+    except OSError as exc:
+        log.warning("Could not write report: %s", exc)
+        res.warnings.append(f"Could not write the TXT report: {exc}")
+
+    report(len(files) + 1, len(files) + 1, "Done")
+    log.info(
+        "Merged %d/%d files -> %s (%d sheets, %d rows; read %d, removed %d) [%s]",
+        res.files_ok, res.files_total, output_file, res.sheets, res.rows,
+        res.rows_read, res.rows_removed, "human" if res.human else "standard",
+    )
+    return res
+
+
+# =============================================================================
+# 8. GUI
+# =============================================================================
+class MergerApp(tk.Tk):
+    BG = "#F5F5F7"
+    FG = "#1D1D1F"
+    MUTED = "#6E6E73"
+    ACCENT = "#0071E3"
+    OK = "#1E9E3A"
+    WARN = "#C77700"
+    ERR = "#D70015"
+    LOG_LINES = 2000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(f"Multi-Sheet Excel Merger Studio v{APP_VERSION}")
+        self.geometry("780x860")
+        self.minsize(720, 760)
+        self.configure(bg=self.BG)
+
+        self._events: "queue.Queue[tuple]" = queue.Queue()
+        self._cancel_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._closing = False
+        self._last_result: Optional[MergeResult] = None
+
+        self._setup_styles()
+        self._build_ui()
+        self._load_settings()
+        self._on_mode_change()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._poll_events)
+        log.info("GUI initialized.")
+
+    # ---- styles --------------------------------------------------------------
+    def _setup_styles(self) -> None:
+        st = ttk.Style(self)
+        st.theme_use("clam")
+        st.configure("TFrame", background=self.BG)
+        st.configure("TLabel", background=self.BG, foreground=self.FG, font=("Segoe UI", 9))
+        st.map("TLabel", foreground=[("disabled", "#A1A1A6")])
+        st.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
+        st.configure("Sub.TLabel", foreground=self.MUTED)
+        st.configure("Hint.TLabel", foreground=self.MUTED, font=("Segoe UI", 8))
+        st.configure("TCheckbutton", background=self.BG, foreground=self.FG, font=("Segoe UI", 9))
+        st.map("TCheckbutton", foreground=[("disabled", "#A1A1A6")])
+        st.configure("Human.TCheckbutton", font=("Segoe UI", 9, "bold"))
+        st.configure("TLabelframe", background=self.BG, bordercolor="#D2D2D7")
+        st.configure("TLabelframe.Label", background=self.BG, foreground=self.FG,
+                     font=("Segoe UI", 9, "bold"))
+        st.configure("TEntry", fieldbackground="#FFFFFF", padding=4)
+        st.configure("TSpinbox", fieldbackground="#FFFFFF", padding=3)
+        st.map("TSpinbox", fieldbackground=[("disabled", "#EBEBF0")])
+        for name, bg, hover, font, pad in (
+            ("Browse.TButton", self.ACCENT, "#0077ED", ("Segoe UI", 9), (10, 4)),
+            ("Run.TButton", "#28CD41", "#24B338", ("Segoe UI", 10, "bold"), (16, 8)),
+            ("Cancel.TButton", "#FF5F56", "#E0443E", ("Segoe UI", 10), (16, 8)),
+            ("Result.TButton", "#5E5CE6", "#4B49C8", ("Segoe UI", 9), (10, 5)),
+        ):
+            st.configure(name, font=font, background=bg, foreground="white",
+                         borderwidth=0, focuscolor="none", padding=pad)
+            st.map(name, background=[("active", hover), ("disabled", "#D2D2D7")],
+                   foreground=[("disabled", "#86868B")])
+        st.configure("Horizontal.TProgressbar", troughcolor="#E8E8ED", background=self.ACCENT)
+
+    # ---- UI construction -------------------------------------------------------
+    def _build_ui(self) -> None:
+        self.var_input = tk.StringVar()
+        self.var_order = tk.StringVar()
+        self.var_output = tk.StringVar()
+        self.var_top = tk.StringVar(value="0")
+        self.var_bottom = tk.StringVar(value="0")
+        self.var_source = tk.BooleanVar(value=False)
+        self.var_human = tk.BooleanVar(value=False)
+        self._persisted = {
+            "input": self.var_input, "order": self.var_order, "output": self.var_output,
+            "top": self.var_top, "bottom": self.var_bottom,
+            "source": self.var_source, "human": self.var_human,
+        }
+
+        root = ttk.Frame(self, padding=(22, 14, 22, 10))
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(6, weight=1)  # log area stretches
+
+        ttk.Label(root, text="Multi-Sheet Excel Merger Studio", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(root, text="Merge .xlsx / .xlsm / .xlsb / .xls / .csv files into one workbook, "
+                             "sheet by sheet.", style="Sub.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(0, 8))
+
+        # -- files --
+        files_box = ttk.LabelFrame(root, text=" Files ", padding=(10, 4, 10, 10))
+        files_box.grid(row=2, column=0, sticky="ew")
+        files_box.columnconfigure(0, weight=1)
+        self._path_row(files_box, 0, "1. Input folder (files to merge):", self.var_input,
+                       lambda: self._browse_dir(self.var_input, "Select input folder"))
+        self._path_row(files_box, 1, "2. Order file (optional, codes in column A):", self.var_order,
+                       self._browse_order)
+        self._path_row(files_box, 2, "3. Output folder for the merged file:", self.var_output,
+                       lambda: self._browse_dir(self.var_output, "Select output folder"))
+
+        # -- mode --
+        mode_box = ttk.LabelFrame(root, text=" Merge mode ", padding=10)
+        mode_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.chk_human = ttk.Checkbutton(
+            mode_box, text="Merge like human (copy & paste in Excel)",
+            variable=self.var_human, style="Human.TCheckbutton", command=self._on_mode_change)
+        self.chk_human.pack(anchor="w")
+        ttk.Label(
+            mode_box,
+            text=("Copies whole sheets through Microsoft Excel, like Ctrl+A → Ctrl+C → Ctrl+V. "
+                  "Nothing is removed: headers, formulas, formatting, colours, merged cells and "
+                  "column widths are kept. Requires desktop Excel. CSV files are appended "
+                  "after the Excel files."),
+            style="Hint.TLabel", wraplength=690, justify="left",
+        ).pack(anchor="w", padx=(22, 0), pady=(2, 0))
+        if os.name != "nt":
+            self.chk_human.state(["disabled"])
+
+        # -- cleanup (standard mode) --
+        self.opts_box = ttk.LabelFrame(root, text=" Row cleanup (standard mode only) ", padding=10)
+        self.opts_box.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.opts_box.columnconfigure(0, weight=1)
+        self.opts_box.columnconfigure(1, weight=1)
+        vcmd = (self.register(lambda v: v == "" or v.isdigit()), "%P")
+
+        self._lbl_top = ttk.Label(self.opts_box, text="Skip rows at the top (before the header):")
+        self._lbl_top.grid(row=0, column=0, sticky="w")
+        self.spin_top = ttk.Spinbox(self.opts_box, from_=0, to=9999, width=10,
+                                    textvariable=self.var_top, validate="key", validatecommand=vcmd)
+        self.spin_top.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(2, 0))
+        self._lbl_bottom = ttk.Label(self.opts_box, text="Skip rows at the bottom (footer / totals):")
+        self._lbl_bottom.grid(row=0, column=1, sticky="w")
+        self.spin_bottom = ttk.Spinbox(self.opts_box, from_=0, to=9999, width=10,
+                                       textvariable=self.var_bottom, validate="key",
+                                       validatecommand=vcmd)
+        self.spin_bottom.grid(row=1, column=1, sticky="ew", pady=(2, 0))
+        self._lbl_cleanup_hint = ttk.Label(
+            self.opts_box, text="Empty rows are ignored when counting footer rows.",
+            style="Hint.TLabel")
+        self._lbl_cleanup_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.chk_source = ttk.Checkbutton(
+            self.opts_box, text="Add a column with the source file name (_Source_File)",
+            variable=self.var_source)
+        self.chk_source.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # -- run / cancel + progress --
+        run_row = ttk.Frame(root)
+        run_row.grid(row=5, column=0, pady=(10, 4))
+        self.btn_run = ttk.Button(run_row, text="RUN MERGE", style="Run.TButton", command=self._start)
+        self.btn_run.pack(side="left", padx=4)
+        self.btn_cancel = ttk.Button(run_row, text="Cancel", style="Cancel.TButton",
+                                     command=self._cancel, state=tk.DISABLED)
+        self.btn_cancel.pack(side="left", padx=4)
+
+        bottom = ttk.Frame(root)
+        bottom.grid(row=6, column=0, sticky="nsew")
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(2, weight=1)
+        self.progress = ttk.Progressbar(bottom, mode="determinate", maximum=100)
+        self.progress.grid(row=0, column=0, sticky="ew", pady=(2, 4))
+        self.lbl_status = tk.Label(bottom, text="Ready to merge", bg=self.BG, fg=self.MUTED,
+                                   font=("Segoe UI", 9, "bold"), wraplength=700, justify="center")
+        self.lbl_status.grid(row=1, column=0, pady=(0, 6))
+
+        log_frame = ttk.Frame(bottom)
+        log_frame.grid(row=2, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.txt_log = tk.Text(log_frame, height=8, wrap="word", state="disabled",
+                               font=("Consolas", 9), bg="#FFFFFF", fg=self.FG, relief="flat",
+                               highlightthickness=1, highlightbackground="#D2D2D7")
+        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=scroll.set)
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        result_row = ttk.Frame(bottom)
+        result_row.grid(row=3, column=0, pady=(8, 0))
+        self.btn_open_file = ttk.Button(result_row, text="Open merged file", style="Result.TButton",
+                                        command=lambda: self._open_result("output_file"),
+                                        state=tk.DISABLED)
+        self.btn_open_report = ttk.Button(result_row, text="Open report", style="Result.TButton",
+                                          command=lambda: self._open_result("report_file"),
+                                          state=tk.DISABLED)
+        self.btn_open_folder = ttk.Button(result_row, text="Open folder", style="Result.TButton",
+                                          command=lambda: self._open_result("folder"),
+                                          state=tk.DISABLED)
+        for b in (self.btn_open_file, self.btn_open_report, self.btn_open_folder):
+            b.pack(side="left", padx=4)
+
+    def _path_row(self, parent: ttk.Frame, idx: int, label: str, var: tk.StringVar,
+                  command) -> None:
+        ttk.Label(parent, text=label).grid(row=idx * 2, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Entry(parent, textvariable=var).grid(row=idx * 2 + 1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(parent, text="Browse…", style="Browse.TButton", command=command).grid(
+            row=idx * 2 + 1, column=1)
+
+    # ---- helpers ---------------------------------------------------------------
+    def _on_mode_change(self) -> None:
+        """Row cleanup options do not apply to 'Merge like human'."""
+        human = self.var_human.get()
+        state = ["disabled"] if human else ["!disabled"]
+        for w in (self.spin_top, self.spin_bottom, self._lbl_top, self._lbl_bottom,
+                  self._lbl_cleanup_hint, self.chk_source):
+            w.state(state)
+
+    def _log_line(self, text: str) -> None:
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", f"{datetime.now():%H:%M:%S}  {text}\n")
+        try:
+            if int(self.txt_log.index("end-1c").split(".")[0]) > self.LOG_LINES:
+                self.txt_log.delete("1.0", "200.0")
+        except (ValueError, tk.TclError):
+            pass
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    # ---- browsing ---------------------------------------------------------------
+    def _browse_dir(self, var: tk.StringVar, title: str) -> None:
+        path = filedialog.askdirectory(title=title, initialdir=var.get() or None)
+        if path:
+            var.set(str(Path(path)))
+
+    def _browse_order(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select order file",
+            filetypes=[("Excel / CSV / text files", "*.xlsx *.xlsm *.xlsb *.xls *.csv *.txt"),
+                       ("All files", "*.*")],
+        )
+        if path:
+            self.var_order.set(str(Path(path)))
+
+    # ---- settings ---------------------------------------------------------------
+    def _load_settings(self) -> None:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for key, var in self._persisted.items():
+            if key in data:
+                try:
+                    var.set(data[key])
+                except tk.TclError:
+                    pass
+        if os.name != "nt":
+            self.var_human.set(False)
+
+    def _save_settings(self) -> None:
+        try:
+            data = {k: v.get() for k, v in self._persisted.items()}
+            SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, tk.TclError):
+            pass
+
+    # ---- processing control ---------------------------------------------------------
+    def _set_running(self, running: bool) -> None:
+        self.btn_run.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.btn_cancel.config(state=tk.NORMAL if running else tk.DISABLED)
+
+    def _set_status(self, text: str, color: str) -> None:
+        self.lbl_status.config(text=text, fg=color)
+
+    @staticmethod
+    def _to_int(value: str) -> int:
+        return int(value) if value.strip().isdigit() else 0
+
+    def _start(self) -> None:
+        input_dir = self.var_input.get().strip()
+        output_dir = self.var_output.get().strip()
+        if not input_dir or not output_dir:
+            self._set_status("Error: input and output folders are required.", self.ERR)
+            return
+        if not Path(input_dir).is_dir() or not Path(output_dir).is_dir():
+            self._set_status("Error: the selected input or output folder does not exist.", self.ERR)
+            return
+
+        order = self.var_order.get().strip()
+        opts = MergeOptions(
+            input_dir=Path(input_dir),
+            output_dir=Path(output_dir),
+            order_file=Path(order) if order else None,
+            skip_top=self._to_int(self.var_top.get()),
+            skip_bottom=self._to_int(self.var_bottom.get()),
+            add_source_column=self.var_source.get(),
+            merge_like_human=self.var_human.get(),
+        )
+        self._save_settings()
+        self._cancel_event.clear()
+        self._last_result = None
+        for b in (self.btn_open_file, self.btn_open_report, self.btn_open_folder):
+            b.config(state=tk.DISABLED)
+        self._clear_log()
+        self._log_line("Started - mode: "
+                       + ("Merge like human (Excel)" if opts.merge_like_human else "Standard"))
+        self._set_running(True)
+        self.progress.config(value=0)
+        self._set_status("Processing… please wait.", self.ACCENT)
+        self._worker = threading.Thread(target=self._worker_main, args=(opts,), daemon=True)
+        self._worker.start()
+
+    def _cancel(self) -> None:
+        self._cancel_event.set()
+        self._set_status("Cancelling… (finishing the current file)", self.MUTED)
+
+    def _worker_main(self, opts: MergeOptions) -> None:
+        """Runs in a worker thread - talks to the GUI ONLY through the queue."""
+        try:
+            result = merge_folder(
+                opts,
+                progress=lambda d, t, m: self._events.put(("progress", d, t, m)),
+                cancel=self._cancel_event,
+            )
+            self._events.put(("done", result))
+        except PermissionError:
+            self._events.put(("error", "Write access denied. Close the file in Excel or choose another folder."))
+        except (ValueError, RuntimeError) as exc:  # user-facing messages
+            log.error("Merge stopped: %s", exc)
+            self._events.put(("error", str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            log.error("Merge failed:\n%s", traceback.format_exc())
+            where = error_location(exc)
+            self._events.put(("error", describe_exception(exc) + (f"  [{where}]" if where else "")))
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event = self._events.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    _, done, total, msg = event
+                    self.progress.config(value=100 * done / max(total, 1))
+                    self._set_status(msg, self.ACCENT)
+                    self._log_line(msg)
+                elif kind == "done":
+                    self._on_done(event[1])
+                elif kind == "error":
+                    self._set_running(False)
+                    self.progress.config(value=0)
+                    self._set_status(f"Error: {event[1]}", self.ERR)
+                    self._log_line(f"ERROR: {event[1]}")
+        except queue.Empty:
+            pass
+
+        if self._closing and not (self._worker and self._worker.is_alive()):
+            self._save_settings()
+            self.destroy()
+            return
+        self.after(100, self._poll_events)
+
+    def _on_done(self, res: MergeResult) -> None:
+        self._set_running(False)
+        if res.cancelled:
+            self.progress.config(value=0)
+            self._set_status("Cancelled - no file was saved.", self.MUTED)
+            self._log_line("Cancelled - no file was saved.")
+            return
+
+        self._last_result = res
+        self.progress.config(value=100)
+        out_name = res.output_file.name if res.output_file else ""
+        rep_name = res.report_file.name if res.report_file else "(report not saved)"
+        has_issues = bool(res.errors or res.warnings)
+        msg = (f"Done: {res.files_ok}/{res.files_total} files, {res.sheets} sheets\n"
+               f"Rows: {res.rows_read:,} read, {res.rows_removed:,} removed, {res.rows:,} in output\n"
+               f"{out_name}  |  {rep_name}")
+        color = self.ERR if res.errors else (self.WARN if has_issues else self.OK)
+        self._set_status(msg, color)
+
+        self._log_line(f"Done: {res.files_ok}/{res.files_total} files, {res.sheets} sheets, "
+                       f"{res.rows:,} rows in output.")
+        for e in res.errors:
+            self._log_line(f"ERROR: {e}")
+        for w in res.warnings:
+            self._log_line(f"WARNING: {w}")
+
+        if res.output_file:
+            self.btn_open_file.config(state=tk.NORMAL)
+            self.btn_open_folder.config(state=tk.NORMAL)
+        if res.report_file:
+            self.btn_open_report.config(state=tk.NORMAL)
+
+        if res.errors:
+            messagebox.showwarning("Merge report", self._format_issues(res))
+
+    def _open_result(self, what: str) -> None:
+        res = self._last_result
+        if not res:
+            return
+        if what == "output_file" and res.output_file:
+            open_path(res.output_file)
+        elif what == "report_file" and res.report_file:
+            open_path(res.report_file)
+        elif what == "folder" and res.output_file:
+            open_path(res.output_file.parent)
+
+    @staticmethod
+    def _format_issues(res: MergeResult, limit: int = 15) -> str:
+        lines: List[str] = []
+        if res.errors:
+            lines.append(f"Files with errors ({len(res.errors)}):")
+            lines += [f"  • {e}" for e in res.errors[:limit]]
+            if len(res.errors) > limit:
+                lines.append("  …")
+        if res.warnings:
+            lines.append(f"\nWarnings ({len(res.warnings)}):")
+            lines += [f"  • {w}" for w in res.warnings[:limit]]
+            if len(res.warnings) > limit:
+                lines.append("  …")
+        if res.report_file:
+            lines.append(f"\nTXT report: {res.report_file}")
+        lines.append(f"Full log: {LOG_FILE}")
+        return "\n".join(lines)
+
+    def _on_close(self) -> None:
+        if self._worker and self._worker.is_alive():
+            if not messagebox.askyesno(
+                "Merge in progress",
+                "A merge is still running.\n\nCancel it and exit?\n"
+                "(The program waits for the current file so that Excel is closed cleanly.)",
+            ):
+                return
+            self._cancel_event.set()
+            self._closing = True
+            self._set_status("Waiting for the current operation to finish…", self.MUTED)
+            return
+        self._save_settings()
+        self.destroy()
+
+
+def main() -> None:
+    try:
+        enable_dpi_awareness()
+        app = MergerApp()
+        log.info("Main loop started.")
+        app.mainloop()
+    except Exception as exc:  # noqa: BLE001
+        log.critical("FATAL CRASH:\n%s", traceback.format_exc())
+        show_native_error("Critical application error",
+                          f"An error occurred:\n\n{exc}\n\nSee: {LOG_FILE}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
